@@ -16,16 +16,48 @@ const UIModule = {
     var toggleBtn = document.getElementById('sidebar-toggle');
     var expandBtn = document.getElementById('sidebar-expand');
 
-    toggleBtn.addEventListener('click', function() {
-      sidebar.classList.add('collapsed');
-      expandBtn.style.display = 'block';
+    function isMobile() { return window.innerWidth <= 600; }
+
+    function collapseSidebar() {
+      if (isMobile()) {
+        sidebar.classList.remove('mobile-open');
+      } else {
+        sidebar.classList.add('collapsed');
+      }
+      document.body.classList.add('sidebar-collapsed');
+      expandBtn.innerHTML = '&#187;'; // » open sidebar
       setTimeout(function() { MapModule.map.invalidateSize(); }, 300);
+    }
+
+    function expandSidebar() {
+      if (isMobile()) {
+        sidebar.classList.add('mobile-open');
+      } else {
+        sidebar.classList.remove('collapsed');
+      }
+      document.body.classList.remove('sidebar-collapsed');
+      expandBtn.innerHTML = '&#171;'; // « close sidebar
+      setTimeout(function() { MapModule.map.invalidateSize(); }, 300);
+    }
+
+    // On mobile, sidebar starts hidden (transform: translateX(-100%))
+    // so open it immediately on load so the user sees it
+    if (isMobile()) {
+      expandSidebar();
+    }
+
+    // Arrow button — universal toggle on all screen sizes
+    expandBtn.addEventListener('click', function() {
+      if (document.body.classList.contains('sidebar-collapsed')) {
+        expandSidebar();
+      } else {
+        collapseSidebar();
+      }
     });
 
-    expandBtn.addEventListener('click', function() {
-      sidebar.classList.remove('collapsed');
-      expandBtn.style.display = 'none';
-      setTimeout(function() { MapModule.map.invalidateSize(); }, 300);
+    // Sidebar header « button — secondary close trigger
+    toggleBtn.addEventListener('click', function() {
+      collapseSidebar();
     });
   },
 

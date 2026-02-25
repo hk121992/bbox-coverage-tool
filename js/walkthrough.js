@@ -14,19 +14,20 @@ var WalkthroughTour = {
       body: 'Plan where to place new parcel lockers across Belgium for maximum population and demand coverage.',
     },
     {
-      target: '.coverage-card',
-      position: 'right',
-      title: 'Current Coverage',
-      body: 'How much of Belgium is already within reach of a bbox locker. Population counts heads; demand-weighted adjusts for age and income.',
-    },
-    {
       target: '#time-slider',
       position: 'right',
       title: 'Travel Time',
       body: 'Maximum travel time to a locker. Adjusts reach per zone: 400m urban, 600m suburban, 4km rural at 5 min. Everything updates instantly.',
     },
     {
-      target: '.mode-toggle',
+      target: '.coverage-card',
+      position: 'right',
+      title: 'Current Coverage',
+      body: 'How much of Belgium is already within reach of a bbox locker. Population counts heads; demand-weighted adjusts for age and income.',
+    },
+    {
+      target: '#planner-controls',
+      spotlight: '#planner-controls',
       position: 'right',
       title: 'Network Planner',
       body: 'Choose what to optimise for, set a target coverage %, and the planner shows how many new lockers are needed to get there.',
@@ -84,7 +85,8 @@ var WalkthroughTour = {
       body: 'Each new locker covers fewer people. The curve shows where adding more stops being cost-effective. Orange = population, blue = demand.',
     },
     {
-      target: '#planner-table',
+      target: '.table-container',
+      spotlight: '.table-container',
       position: 'right',
       title: 'Proposed Locations',
       body: 'Ranked by impact. Click a row to fly to it on the map. Export to CSV for further analysis.',
@@ -188,25 +190,53 @@ var WalkthroughTour = {
 
     // Position
     if (!step.target || step.position === 'center') {
-      // Centre on screen
-      tooltip.style.top = '50%';
-      tooltip.style.left = '50%';
-      tooltip.style.transform = 'translate(-50%, -50%)';
+      // Centre on screen — use JS on mobile to avoid transform overflow
+      if (window.innerWidth <= 600) {
+        tooltip.style.transform = '';
+        var pad = 16;
+        tooltip.style.left = pad + 'px';
+        tooltip.style.top = Math.round(window.innerHeight / 2 - (tooltip.offsetHeight || 220) / 2) + 'px';
+      } else {
+        tooltip.style.top = '50%';
+        tooltip.style.left = '50%';
+        tooltip.style.transform = 'translate(-50%, -50%)';
+      }
     } else {
       tooltip.style.transform = '';
       var el = document.querySelector(step.target);
       if (el) {
-        // Scroll sidebar to show element
-        el.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+        // Spotlight: use explicit step.spotlight selector, or parent .control-group, or element itself
+        var spotlightEl = (step.spotlight ? document.querySelector(step.spotlight) : null)
+                          || el.closest('.control-group')
+                          || el;
+        spotlightEl.classList.add('wt-spotlight');
+        this._prevSpotlight = spotlightEl;
 
-        // Spotlight
-        el.classList.add('wt-spotlight');
-        this._prevSpotlight = el;
-
-        // Position tooltip near the element
-        setTimeout(function() {
-          self._positionTooltip(tooltip, el, step.position);
-        }, 50);
+        // Scroll the sidebar panel so the spotlit element is visible.
+        // On mobile: tooltip goes above the element, so we want the element
+        // near the bottom of the viewport. We manually scroll the sidebar panel.
+        var sidebarPanel = document.getElementById('panel-main');
+        if (sidebarPanel && window.innerWidth <= 600) {
+          // Scroll element into view first (instant) to get a stable rect
+          spotlightEl.scrollIntoView({ block: 'nearest', behavior: 'instant' });
+          // Then nudge so element sits ~80px from viewport bottom (leaves room for it to be seen)
+          var elRect = spotlightEl.getBoundingClientRect();
+          var targetBottom = window.innerHeight - 80;
+          if (elRect.bottom > targetBottom) {
+            sidebarPanel.scrollTop += elRect.bottom - targetBottom;
+          } else if (elRect.top < 0) {
+            sidebarPanel.scrollTop += elRect.top - 16;
+          }
+          // Position tooltip after a short settle
+          setTimeout(function() {
+            self._positionTooltip(tooltip, spotlightEl, step.position);
+          }, 100);
+        } else {
+          spotlightEl.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+          setTimeout(function() {
+            self._positionTooltip(tooltip, spotlightEl, step.position);
+          }, 400);
+        }
       } else {
         tooltip.style.top = '50%';
         tooltip.style.left = '50%';
@@ -239,27 +269,48 @@ var WalkthroughTour = {
 
   _positionTooltip: function(tooltip, target, side) {
     var rect = target.getBoundingClientRect();
-    var tw = 320;
     var pad = 16;
+    var vw = window.innerWidth;
+    var vh = window.innerHeight;
+    var isMobile = vw <= 600;
 
-    if (side === 'right') {
-      // Place to the right of the sidebar element
-      var left = rect.right + pad;
-      if (left + tw > window.innerWidth) {
-        // Fall back: place below
-        left = Math.min(rect.left, window.innerWidth - tw - pad);
+    // On mobile the tooltip spans nearly full width — measure after layout
+    var tw = tooltip.offsetWidth || (isMobile ? vw - pad * 2 : 320);
+    var th = tooltip.offsetHeight || 220;
+
+    var left, top;
+
+    if (!isMobile && side === 'right') {
+      // Desktop: prefer right of element
+      var rightLeft = rect.right + pad;
+      if (rightLeft + tw <= vw - pad) {
+        left = rightLeft;
+        top = Math.max(pad, Math.min(rect.top + rect.height / 2 - th / 2, vh - th - pad));
+      } else {
+        // Fallback: centred, above element
+        left = Math.max(pad, Math.min(rect.left + rect.width / 2 - tw / 2, vw - tw - pad));
+        top = Math.max(pad, rect.top - th - pad);
       }
-      var top = Math.max(pad, Math.min(rect.top, window.innerHeight - 260));
-      tooltip.style.left = left + 'px';
-      tooltip.style.top = top + 'px';
-    } else if (side === 'left') {
-      // Place to the left of the map
-      var left = rect.left - tw - pad;
-      if (left < 0) left = pad;
-      var top = Math.max(pad, Math.min(rect.top + rect.height / 2 - 80, window.innerHeight - 260));
-      tooltip.style.left = left + 'px';
-      tooltip.style.top = top + 'px';
+    } else if (!isMobile && side === 'left') {
+      left = Math.max(pad, rect.left - tw - pad);
+      top = Math.max(pad, Math.min(rect.top + rect.height / 2 - th / 2, vh - th - pad));
+    } else {
+      // Mobile (or unknown side): place above element if room, else below
+      left = pad;
+      var aboveTop = rect.top - th - pad;
+      var belowTop = rect.bottom + pad;
+      if (aboveTop >= pad) {
+        top = aboveTop;
+      } else if (belowTop + th <= vh - pad) {
+        top = belowTop;
+      } else {
+        // Not enough room above or below — anchor to top of screen
+        top = pad;
+      }
     }
+
+    tooltip.style.left = left + 'px';
+    tooltip.style.top = top + 'px';
   },
 
   _close: function() {

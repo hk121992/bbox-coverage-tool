@@ -108,43 +108,43 @@
       <!-- Planner Section -->
       <div class="section-header">Network Planner</div>
 
-      <!-- Coverage Mode Toggle -->
-      <div class="control-group">
-        <label>Optimise for</label>
-        <div class="mode-toggle">
-          <button class="mode-btn active" id="mode-population" data-mode="population">Population</button>
-          <button class="mode-btn" id="mode-demand" data-mode="demand">Demand-weighted</button>
+      <!-- #planner-controls wraps inputs + primary results for walkthrough spotlight -->
+      <div id="planner-controls">
+
+        <!-- Coverage Mode Toggle -->
+        <div class="control-group">
+          <label>Optimise for</label>
+          <div class="mode-toggle">
+            <button class="mode-btn active" id="mode-population" data-mode="population">Population</button>
+            <button class="mode-btn" id="mode-demand" data-mode="demand">Demand-weighted</button>
+          </div>
+          <div id="demand-unavailable" style="display:none" class="mode-warning">Demand data not yet available</div>
         </div>
-        <div id="demand-unavailable" style="display:none" class="mode-warning">Demand data not yet available</div>
-      </div>
 
-      <div class="control-group">
-        <label>Target coverage</label>
-        <div class="slider-row">
-          <input type="range" id="planner-target-slider" min="0" max="99" value="95" step="1">
-          <span id="planner-target-value" class="slider-value">95%</span>
+        <div class="control-group">
+          <label>Target coverage</label>
+          <div class="slider-row">
+            <input type="range" id="planner-target-slider" min="0" max="99" value="95" step="1">
+            <span id="planner-target-value" class="slider-value">95%</span>
+          </div>
         </div>
-      </div>
 
-      <div class="control-group">
-        <label class="checkbox-label">
-          <input type="checkbox" id="use-supermarkets">
-          Top up with nearest supermarket locations
-        </label>
-      </div>
-
-      <div id="supermarket-target-group" class="control-group" style="display:none">
-        <label>Supermarket top-up target</label>
-        <div class="slider-row">
-          <input type="range" id="sm-target-slider" min="0" max="99" value="99" step="1">
-          <span id="sm-target-value" class="slider-value">99%</span>
+        <div class="control-group">
+          <label class="checkbox-label">
+            <input type="checkbox" id="use-supermarkets">
+            Top up with nearest supermarket locations
+          </label>
         </div>
-      </div>
 
-      <!-- Planner Results -->
-      <div id="planner-results">
+        <div id="supermarket-target-group" class="control-group" style="display:none">
+          <label>Supermarket top-up target</label>
+          <div class="slider-row">
+            <input type="range" id="sm-target-slider" min="0" max="99" value="99" step="1">
+            <span id="sm-target-value" class="slider-value">99%</span>
+          </div>
+        </div>
 
-        <!-- Primary row: always visible -->
+        <!-- Primary results row -->
         <div class="plan-primary-row">
           <div class="stat-card stat-covered plan-cov-card">
             <span class="stat-label">Planned Coverage</span>
@@ -162,6 +162,11 @@
             </div>
           </div>
         </div>
+
+      </div><!-- /#planner-controls -->
+
+      <!-- Planner Results (rest: SM breakdown, chart, table) -->
+      <div id="planner-results">
 
         <!-- Supermarket breakdown: only when SM enabled -->
         <div id="plan-sm-breakdown" style="display:none" class="stats-grid">
@@ -228,8 +233,8 @@
     </div>
   </div>
 
-  <!-- Sidebar toggle when collapsed -->
-  <button id="sidebar-expand" aria-label="Expand sidebar">&raquo;</button>
+  <!-- Sidebar toggle — always visible, shows « when open, » when collapsed -->
+  <button id="sidebar-expand" aria-label="Toggle sidebar">&#171;</button>
 
   <!-- Map -->
   <div id="map"></div>

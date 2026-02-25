@@ -118,24 +118,30 @@ body {
 
 #sidebar-expand {
   position: fixed;
-  left: 0;
-  top: 50%;
-  transform: translateY(-50%);
-  z-index: 1001;
-  background: var(--sidebar-bg);
-  border: 1px solid var(--sidebar-border);
-  border-left: none;
-  color: var(--text-muted);
-  font-size: 18px;
-  cursor: pointer;
-  padding: 12px 6px;
+  top: 16px;
+  left: 360px;           /* right edge of open sidebar on desktop */
+  z-index: 1300;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 36px;
+  background: var(--orange-proposed);
+  border: none;
   border-radius: 0 6px 6px 0;
-  display: none;
-  transition: color 0.2s;
+  color: #ffffff;
+  font-size: 16px;
+  cursor: pointer;
+  transition: left 0.3s ease, background 0.2s;
 }
 
 #sidebar-expand:hover {
-  color: var(--text-bright);
+  background: var(--orange-proposed-dark);
+}
+
+/* Collapsed: button slides to left edge, arrow points right */
+body.sidebar-collapsed #sidebar-expand {
+  left: 0;
 }
 
 /* === Panels === */
@@ -692,7 +698,7 @@ input[type="range"]::-moz-range-thumb {
   position: fixed;
   inset: 0;
   z-index: 2999;
-  background: rgba(0, 0, 0, 0.55);
+  background: rgba(0, 0, 0, 0.20);
   transition: opacity 0.25s ease;
 }
 
@@ -796,6 +802,69 @@ input[type="range"]::-moz-range-thumb {
 .wt-spotlight {
   position: relative;
   z-index: 3000;
-  box-shadow: 0 0 0 4000px rgba(0, 0, 0, 0.55);
   border-radius: 8px;
+  outline: 3px solid var(--orange-proposed);
+  outline-offset: 3px;
+  filter: brightness(1.15);
+  box-shadow: 0 0 18px 6px rgba(255, 255, 255, 0.12);
 }
+
+/* =============================================
+   MOBILE RESPONSIVE — Level 1 (≤600px)
+   ============================================= */
+
+
+@media (max-width: 600px) {
+
+  /* Sidebar: fixed overlay leaving 60px map sliver, hidden by default */
+  #sidebar {
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: calc(100vw - 60px);
+    min-width: 0;
+    height: 100vh;
+    z-index: 1100;
+    transform: translateX(-100%);
+    transition: transform 0.3s ease;
+    margin-left: 0;
+  }
+
+  #sidebar.mobile-open {
+    transform: translateX(0);
+  }
+
+  /* Map fills full screen on mobile */
+  #map {
+    width: 100vw;
+    flex: none;
+  }
+
+  /* Arrow toggle button: sits at right edge of open sidebar on mobile */
+  #sidebar-expand {
+    left: calc(100vw - 60px);
+    top: 16px;
+  }
+
+  body.sidebar-collapsed #sidebar-expand {
+    left: 0;
+  }
+
+  /* Stats grid: 3-col → 2-col */
+  .stats-grid-3 {
+    grid-template-columns: 1fr 1fr;
+  }
+
+  /* Third card spans full width when it wraps */
+  .stats-grid-3 .stat-card:last-child {
+    grid-column: 1 / -1;
+  }
+
+  /* Walkthrough tooltip: cap to viewport width, let JS handle position */
+  #wt-tooltip {
+    width: calc(100vw - 32px);
+    max-width: calc(100vw - 32px);
+    transform: none !important;
+  }
+
+} /* end @media (max-width: 600px) */
