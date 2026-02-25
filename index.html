@@ -1,0 +1,244 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>bbox Coverage Modelling Tool</title>
+
+  <!-- Google Fonts -->
+  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+
+  <!-- Leaflet -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+
+  <!-- Chart.js -->
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"></script>
+
+  <!-- App CSS -->
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+
+  <!-- Loading Overlay -->
+  <div id="loading-overlay">
+    <div class="loader-content">
+      <div class="spinner"></div>
+      <p id="loading-text">Loading data...</p>
+      <div class="progress-bar-container">
+        <div id="progress-fill"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Sidebar -->
+  <div id="sidebar">
+    <div id="sidebar-header">
+      <div>
+        <h1>bbox Coverage Tool</h1>
+        <p class="subtitle">Belgium parcel locker network analysis</p>
+      </div>
+      <button id="sidebar-toggle" aria-label="Collapse sidebar">&laquo;</button>
+    </div>
+
+    <!-- Single panel -->
+    <div id="panel-main" class="panel active">
+
+      <!-- Travel Time -->
+      <div class="control-group">
+        <label>Max travel time</label>
+        <div class="slider-row">
+          <input type="range" id="time-slider" min="1" max="15" value="5" step="1">
+          <span id="time-value" class="slider-value">5 min</span>
+        </div>
+      </div>
+
+      <!-- Current Network Stats -->
+      <div class="section-header">Current Network</div>
+
+      <!-- Coverage wide card: pop + demand side by side -->
+      <div class="coverage-card">
+        <div class="coverage-half">
+          <span class="cov-label">Population<br>Coverage</span>
+          <span class="cov-pct" id="stat-pop-pct">--</span>
+          <span class="cov-sub" id="stat-pop-sub">-- / --</span>
+        </div>
+        <div class="coverage-divider"></div>
+        <div class="coverage-half">
+          <span class="cov-label">Demand-Weighted<br>Coverage</span>
+          <span class="cov-pct demand" id="stat-dem-pct">--</span>
+          <span class="cov-sub" id="stat-dem-sub"></span>
+        </div>
+      </div>
+
+      <div class="stats-grid stats-grid-3">
+        <div class="stat-card stat-uncovered">
+          <span class="stat-label">Uncovered Pop</span>
+          <span class="stat-value" id="stat-uncovered-pop">--</span>
+          <span class="stat-pct" id="stat-uncovered-pct">--</span>
+        </div>
+        <div class="stat-card demand-border">
+          <span class="stat-label">Demand Gap</span>
+          <span class="stat-value" id="stat-dem-uncovered">--</span>
+          <span class="stat-pct" id="stat-dem-uncovered-pct">--</span>
+        </div>
+        <div class="stat-card">
+          <span class="stat-label">bbox Lockers</span>
+          <span class="stat-value" id="stat-locker-count">--</span>
+        </div>
+      </div>
+
+      <!-- Regional Breakdown -->
+      <div class="section-header">Regional Breakdown</div>
+      <div class="region-list">
+        <div class="region-row">
+          <span class="region-name">Flanders</span>
+          <span class="region-stat" id="stat-flanders">--</span>
+        </div>
+        <div class="region-row">
+          <span class="region-name">Wallonia</span>
+          <span class="region-stat" id="stat-wallonia">--</span>
+        </div>
+        <div class="region-row">
+          <span class="region-name">Brussels</span>
+          <span class="region-stat" id="stat-brussels">--</span>
+        </div>
+      </div>
+
+      <!-- Planner Section -->
+      <div class="section-header">Network Planner</div>
+
+      <!-- Coverage Mode Toggle -->
+      <div class="control-group">
+        <label>Optimise for</label>
+        <div class="mode-toggle">
+          <button class="mode-btn active" id="mode-population" data-mode="population">Population</button>
+          <button class="mode-btn" id="mode-demand" data-mode="demand">Demand-weighted</button>
+        </div>
+        <div id="demand-unavailable" style="display:none" class="mode-warning">Demand data not yet available</div>
+      </div>
+
+      <div class="control-group">
+        <label>Target coverage</label>
+        <div class="slider-row">
+          <input type="range" id="planner-target-slider" min="0" max="99" value="95" step="1">
+          <span id="planner-target-value" class="slider-value">95%</span>
+        </div>
+      </div>
+
+      <div class="control-group">
+        <label class="checkbox-label">
+          <input type="checkbox" id="use-supermarkets">
+          Top up with nearest supermarket locations
+        </label>
+      </div>
+
+      <div id="supermarket-target-group" class="control-group" style="display:none">
+        <label>Supermarket top-up target</label>
+        <div class="slider-row">
+          <input type="range" id="sm-target-slider" min="0" max="99" value="99" step="1">
+          <span id="sm-target-value" class="slider-value">99%</span>
+        </div>
+      </div>
+
+      <!-- Planner Results -->
+      <div id="planner-results">
+
+        <!-- Primary row: always visible -->
+        <div class="plan-primary-row">
+          <div class="stat-card stat-covered plan-cov-card">
+            <span class="stat-label">Planned Coverage</span>
+            <span class="stat-value" id="plan-total-cov">--</span>
+          </div>
+          <div class="plan-counts">
+            <div class="plan-count-item">
+              <span class="stat-label">Additional</span>
+              <span class="plan-count-value" id="plan-additional">--</span>
+            </div>
+            <div class="plan-count-divider"></div>
+            <div class="plan-count-item">
+              <span class="stat-label">Total</span>
+              <span class="plan-count-value" id="plan-total-lockers">--</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- Supermarket breakdown: only when SM enabled -->
+        <div id="plan-sm-breakdown" style="display:none" class="stats-grid">
+          <div class="stat-card">
+            <span class="stat-label">After Optimal</span>
+            <span class="stat-value" id="plan-optimal-cov">--</span>
+          </div>
+          <div class="stat-card" id="plan-sm-card">
+            <span class="stat-label">After Supermarkets</span>
+            <span class="stat-value" id="plan-sm-cov">--</span>
+          </div>
+        </div>
+        <div id="plan-redundant-count" style="display:none" class="redundant-note"></div>
+
+        <div class="chart-container">
+          <canvas id="planner-chart"></canvas>
+        </div>
+
+        <div class="section-header">Top Placements</div>
+        <div class="table-container">
+          <table id="planner-table">
+            <thead>
+              <tr>
+                <th>#</th>
+                <th>Location</th>
+                <th>Gain</th>
+                <th>Cumul.</th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+
+        <button id="export-csv" class="btn-secondary" style="margin-top:8px">Export Locations (CSV)</button>
+      </div>
+
+      <!-- Legend -->
+      <div class="section-header" style="margin-top:16px">Legend</div>
+      <div class="legend">
+        <div class="legend-item"><span class="legend-dot" style="background:#2563eb"></span> Existing bbox locker</div>
+        <div class="legend-item"><span class="legend-swatch" style="background:rgba(34,197,94,0.3)"></span> Covered sector</div>
+        <div class="legend-item"><span class="legend-swatch" style="background:rgba(239,68,68,0.3)"></span> Uncovered sector</div>
+        <div class="legend-item"><span class="legend-dot" style="background:#f59e0b"></span> Optimal placement</div>
+        <div class="legend-item" id="legend-sm" style="display:none"><span class="legend-dot" style="background:#16a34a"></span> Supermarket placement</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Walkthrough Tour -->
+  <div id="wt-overlay" class="hidden"></div>
+  <div id="wt-tooltip" class="hidden">
+    <div id="wt-step-indicator"></div>
+    <h3 id="wt-title"></h3>
+    <p id="wt-body"></p>
+    <div id="wt-footer">
+      <label class="wt-checkbox-label" id="wt-dismiss-row" style="display:none">
+        <input type="checkbox" id="wt-dont-show">
+        Don't show again
+      </label>
+      <div id="wt-buttons">
+        <button id="wt-back" class="wt-btn wt-btn-back">Back</button>
+        <button id="wt-next" class="wt-btn wt-btn-next">Next</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Sidebar toggle when collapsed -->
+  <button id="sidebar-expand" aria-label="Expand sidebar">&raquo;</button>
+
+  <!-- Map -->
+  <div id="map"></div>
+
+  <!-- Scripts (order matters) -->
+  <script src="js/map.js"></script>
+  <script src="js/chart.js"></script>
+  <script src="js/ui.js"></script>
+  <script src="js/walkthrough.js"></script>
+  <script src="js/app.js"></script>
+</body>
+</html>

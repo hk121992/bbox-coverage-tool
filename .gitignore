@@ -1,0 +1,18 @@
+# Raw source geodata (too large for git)
+data/sh_statbel_statistical_sectors_31370_20220101.geojson/
+data/sh_statbel_statistical_sectors_31370_20220101.geojson.zip
+
+# Raw population source data
+data/statbel_age_sex/
+data/statbel_age_sex_2025.zip
+
+# Raw spreadsheet sources
+data/statbel_fiscal_income.xlsx
+data/statbel_population.xlsx
+
+# Unprocessed supermarket data
+data/supermarkets_raw.json
+
+# OS / editor
+.DS_Store
+.vscode/
