@@ -30,14 +30,13 @@ Travel time thresholds are adjusted by area type: walking in urban zones (400m/5
 ### Optimisation
 The Network Planner uses the Maximal Covering Location Problem (MCLP) framework. The greedy algorithm provides a (1 - 1/e) approximation guarantee for the coverage objective. Placements are precomputed for travel times 1–15 minutes under both population and demand-weighted modes.
 
-Optionally, a supermarket top-up phase runs a live greedy pass to identify existing supermarket locations that would cover remaining demand after optimal placements.
+Optionally, a supermarket top-up phase uses precomputed results to identify existing supermarket locations that would cover remaining demand after optimal placements.
 
 ## Usage
-Open `index.html` in any modern browser. No installation required.
 
-**Note:** Must be served via HTTP (e.g., `python3 -m http.server`) due to Web Worker and fetch requirements — opening the file directly (`file://`) will not work in most browsers.
+**Live:** https://hk121992.github.io/bbox-coverage-tool/
 
-## Quick Start
+**Local:** Must be served via HTTP due to `fetch` requirements — opening `file://` directly will not work.
 ```bash
 cd bbox-coverage-tool
 python3 -m http.server 8000
@@ -64,4 +63,5 @@ Steps 1 and 3 can be parallelised across travel times by running multiple instan
 Output files:
 - `data/placements.json` — population-weighted precomputed placements
 - `data/placements_demand.json` — demand-weighted precomputed placements
+- `data/placements_sm.json` — precomputed supermarket top-up placements
 - `data/centroids.json` — enriched with demand scores after step 2
