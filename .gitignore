@@ -22,6 +22,7 @@ data/supermarkets_raw.json
 
 # Analysis outputs (generated, large)
 notebooks/output/
+notebooks/*_executed.ipynb
 data/enriched/
 data/training/
 data/local_reports/
