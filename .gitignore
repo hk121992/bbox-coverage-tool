@@ -16,3 +16,15 @@ data/supermarkets_raw.json
 # OS / editor
 .DS_Store
 .vscode/
+
+# Environment secrets
+.env
+
+# Analysis outputs (generated, large)
+notebooks/output/
+data/enriched/
+data/training/
+data/local_reports/
+
+# Claude Code settings
+.claude/

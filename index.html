@@ -105,6 +105,91 @@
         </div>
       </div>
 
+      <!-- Competitive Landscape -->
+      <div class="section-header">Competitive Landscape</div>
+
+      <div class="control-group">
+        <label class="checkbox-label">
+          <input type="checkbox" id="show-competitors">
+          Show competitor locations
+        </label>
+      </div>
+
+      <div id="competitor-operator-toggles" style="display:none">
+        <div class="comp-op-grid" id="comp-op-grid">
+          <!-- Dynamically populated by ui.js -->
+        </div>
+      </div>
+
+      <div id="competitor-stats" style="display:none">
+        <div class="stats-grid">
+          <div class="stat-card">
+            <span class="stat-label">Competitor Points</span>
+            <span class="stat-value" id="stat-comp-total">--</span>
+          </div>
+          <div class="stat-card">
+            <span class="stat-label">Sectors w/ Competitor</span>
+            <span class="stat-value" id="stat-comp-sectors">--</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="control-group" id="sector-color-mode-group" style="display:none">
+        <label>Sector coloring</label>
+        <div class="mode-toggle">
+          <button class="mode-btn active" id="sc-mode-coverage" data-sector-mode="coverage">Coverage</button>
+          <button class="mode-btn" id="sc-mode-competitive" data-sector-mode="competitive">Competitive Gap</button>
+          <button class="mode-btn" id="sc-mode-strategic" data-sector-mode="strategic">Strategic</button>
+        </div>
+      </div>
+
+      <!-- Strategic Insights -->
+      <div class="section-header" id="strategic-header" style="display:none">Strategic Insights</div>
+      <div id="strategic-panel" style="display:none">
+        <div class="quadrant-grid">
+          <div class="quadrant-card" data-quadrant="blue_ocean">
+            <div class="quadrant-dot" style="background:#3b82f6"></div>
+            <div class="quadrant-info">
+              <span class="quadrant-name">Blue Ocean</span>
+              <span class="quadrant-desc">High demand · Low competition</span>
+              <span class="quadrant-stats" id="q-blue_ocean">--</span>
+            </div>
+          </div>
+          <div class="quadrant-card" data-quadrant="battleground">
+            <div class="quadrant-dot" style="background:#ef4444"></div>
+            <div class="quadrant-info">
+              <span class="quadrant-name">Battleground</span>
+              <span class="quadrant-desc">High demand · High competition</span>
+              <span class="quadrant-stats" id="q-battleground">--</span>
+            </div>
+          </div>
+          <div class="quadrant-card" data-quadrant="frontier">
+            <div class="quadrant-dot" style="background:#a78bfa"></div>
+            <div class="quadrant-info">
+              <span class="quadrant-name">Frontier</span>
+              <span class="quadrant-desc">Low demand · Low competition</span>
+              <span class="quadrant-stats" id="q-frontier">--</span>
+            </div>
+          </div>
+          <div class="quadrant-card" data-quadrant="crowded_niche">
+            <div class="quadrant-dot" style="background:#6b7280"></div>
+            <div class="quadrant-info">
+              <span class="quadrant-name">Crowded Niche</span>
+              <span class="quadrant-desc">Low demand · High competition</span>
+              <span class="quadrant-stats" id="q-crowded_niche">--</span>
+            </div>
+          </div>
+        </div>
+        <div class="control-group" style="margin-top:6px">
+          <label class="checkbox-label">
+            <input type="checkbox" id="strategic-hide-covered">
+            Hide covered sectors on map
+          </label>
+        </div>
+        <button class="btn-secondary quadrant-reset-btn" id="quadrant-reset" style="display:none;margin-top:6px;width:100%">Show All Quadrants</button>
+        <div id="quadrant-filter-note" class="quadrant-filter-note" style="display:none"></div>
+      </div>
+
       <!-- Planner Section -->
       <div class="section-header">Network Planner</div>
 
@@ -185,6 +270,7 @@
           <canvas id="planner-chart"></canvas>
         </div>
 
+        <div id="planner-filter-summary" style="display:none" class="planner-filter-summary"></div>
         <div class="section-header">Top Placements</div>
         <div class="table-container">
           <table id="planner-table">
@@ -211,6 +297,15 @@
         <div class="legend-item"><span class="legend-swatch" style="background:rgba(239,68,68,0.3)"></span> Uncovered sector</div>
         <div class="legend-item"><span class="legend-dot" style="background:#f59e0b"></span> Optimal placement</div>
         <div class="legend-item" id="legend-sm" style="display:none"><span class="legend-dot" style="background:#16a34a"></span> Supermarket placement</div>
+        <div class="legend-item" id="legend-comp" style="display:none"><span class="legend-dot" style="background:#9ca3af"></span> Competitor location</div>
+        <div class="legend-item" id="legend-gap-greenfield" style="display:none"><span class="legend-swatch" style="background:rgba(124,58,237,0.25)"></span> Greenfield (no competitors)</div>
+        <div class="legend-item" id="legend-gap-saturated" style="display:none"><span class="legend-swatch" style="background:rgba(245,158,11,0.25)"></span> Saturated (3+ operators)</div>
+        <div class="legend-item" id="legend-q-blue" style="display:none"><span class="legend-swatch" style="background:rgba(59,130,246,0.35)"></span> Blue Ocean</div>
+        <div class="legend-item" id="legend-q-battle" style="display:none"><span class="legend-swatch" style="background:rgba(239,68,68,0.35)"></span> Battleground</div>
+        <div class="legend-item" id="legend-q-frontier" style="display:none"><span class="legend-swatch" style="background:rgba(167,139,250,0.35)"></span> Frontier</div>
+        <div class="legend-item" id="legend-q-crowded" style="display:none"><span class="legend-swatch" style="background:rgba(107,114,128,0.35)"></span> Crowded Niche</div>
+        <div class="legend-item" id="legend-q-uncovered" style="display:none"><span class="legend-swatch" style="background:rgba(59,130,246,0.35);outline:2px solid rgba(59,130,246,0.5);outline-offset:-1px"></span> Uncovered (opportunity)</div>
+        <div class="legend-item" id="legend-q-covered" style="display:none"><span class="legend-swatch" style="background:rgba(59,130,246,0.08)"></span> Covered (addressed)</div>
       </div>
     </div>
   </div>

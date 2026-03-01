@@ -7,6 +7,9 @@ var App = {
     supermarkets: null,
     centroids: null,
     sectors: null,
+    competitors: null,
+    competitiveCoverage: null,
+    strategicQuadrants: null,
   },
   precomputed: null,       // loaded from placements.json (population)
   precomputedDemand: null, // loaded from placements_demand.json
@@ -23,6 +26,10 @@ var App = {
     plannerTargetCoverage: 95,
     useSupermarkets: false,
     smTargetCoverage: 99,
+    showCompetitors: false,
+    sectorColorMode: 'coverage',
+    quadrantFilter: null,
+    strategicHideCovered: false,
   },
   map: null,
 };
@@ -297,6 +304,9 @@ async function init() {
       fetch('data/placements.json').then(function(r) { return r.json(); }),
       fetch('data/placements_demand.json').then(function(r) { return r.json(); }).catch(function() { return null; }),
       fetch('data/placements_sm.json').then(function(r) { return r.json(); }).catch(function() { return null; }),
+      fetch('data/competitors.json').then(function(r) { return r.json(); }).catch(function() { return null; }),
+      fetch('data/competitive_coverage.json').then(function(r) { return r.json(); }).catch(function() { return null; }),
+      fetch('data/strategic_quadrants.json').then(function(r) { return r.json(); }).catch(function() { return null; }),
     ]);
 
     App.data.bbox = responses[0];
@@ -305,12 +315,18 @@ async function init() {
     App.precomputed = responses[3];
     App.precomputedDemand = responses[4];
     App.precomputedSm = responses[5];
+    App.data.competitors = responses[6];
+    App.data.competitiveCoverage = responses[7];
+    App.data.strategicQuadrants = responses[8];
 
     showLoading('Initializing map...', 30);
 
     // Init map and add bbox markers immediately
     App.map = MapModule.init('map');
     MapModule.addBboxMarkers(App.data.bbox);
+    if (App.data.competitors) {
+      MapModule.addCompetitorMarkers(App.data.competitors);
+    }
 
     // Build bbox spatial index for distance queries
     App.state.bboxSpatialIndex = buildSpatialIndex(App.data.bbox);
@@ -362,6 +378,8 @@ async function init() {
     console.log('Sectors:', App.data.sectors.features.length);
     console.log('bbox lockers:', App.data.bbox.length);
     console.log('Supermarkets:', App.data.supermarkets.length);
+    console.log('Competitors:', App.data.competitors ? App.data.competitors.length : 'not loaded');
+    console.log('Strategic quadrants:', App.data.strategicQuadrants ? Object.keys(App.data.strategicQuadrants.sectors).length + ' sectors classified' : 'not loaded');
     console.log('Coverage:', App.state.coverageResults.coveragePercent.toFixed(1) + '%');
     console.log('Precomputed placements loaded for travel times 1-15');
 

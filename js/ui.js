@@ -7,6 +7,8 @@ const UIModule = {
     this.setupSidebarToggle();
     this.setupModeToggle();
     this.setupTimeSlider();
+    this.setupCompetitorPanel();
+    this.setupStrategicPanel();
     this.setupPlannerPanel();
   },
 
@@ -69,7 +71,7 @@ const UIModule = {
 
         var results = computeCoverage(App.data.bbox, App.data.centroids, App.state.travelMinutes);
         App.state.coverageResults = results;
-        MapModule.updateSectorColors(results);
+        MapModule.setSectorColorMode(App.state.sectorColorMode);
         self.updateStats(results);
         self.syncTargetSliderMin();
         self.updatePlannerResults();
@@ -93,7 +95,7 @@ const UIModule = {
 
         var results = computeCoverage(App.data.bbox, App.data.centroids, val);
         App.state.coverageResults = results;
-        MapModule.updateSectorColors(results);
+        MapModule.setSectorColorMode(App.state.sectorColorMode);
         self.updateStats(results);
         self.syncTargetSliderMin();
         self.updatePlannerResults();
@@ -171,6 +173,44 @@ const UIModule = {
           pct + '% (' + data.covered.toLocaleString() + ' / ' + data.total.toLocaleString() + ')';
       }
     }
+
+    this.updateStrategicStats();
+  },
+
+  updateStrategicStats() {
+    if (!App.data.strategicQuadrants || !App.state.coverageResults) return;
+
+    var quadSectors = App.data.strategicQuadrants.sectors;
+    var coveredSet = new Set(App.state.coverageResults.covered.map(function(c) { return c.sc; }));
+
+    var stats = {
+      blue_ocean:    { count: 0, uncoveredCount: 0, uncoveredPop: 0 },
+      battleground:  { count: 0, uncoveredCount: 0, uncoveredPop: 0 },
+      frontier:      { count: 0, uncoveredCount: 0, uncoveredPop: 0 },
+      crowded_niche: { count: 0, uncoveredCount: 0, uncoveredPop: 0 },
+    };
+
+    for (var i = 0; i < App.data.centroids.length; i++) {
+      var c = App.data.centroids[i];
+      if (c.pop === 0) continue;
+      var q = quadSectors[c.sc];
+      if (!q || !stats[q]) continue;
+
+      stats[q].count++;
+      if (!coveredSet.has(c.sc)) {
+        stats[q].uncoveredCount++;
+        stats[q].uncoveredPop += c.pop;
+      }
+    }
+
+    ['blue_ocean', 'battleground', 'frontier', 'crowded_niche'].forEach(function(q) {
+      var el = document.getElementById('q-' + q);
+      if (el) {
+        el.innerHTML = '<strong>' + stats[q].uncoveredCount.toLocaleString() + '</strong> uncovered / ' +
+          stats[q].count.toLocaleString() + ' total' +
+          '<br>' + stats[q].uncoveredPop.toLocaleString() + ' uncov. pop';
+      }
+    });
   },
 
   setupPlannerPanel() {
@@ -320,10 +360,16 @@ const UIModule = {
     var tbody = document.querySelector('#planner-table tbody');
     tbody.innerHTML = '';
 
-    function makeRow(cells, lat, lng) {
+    var quadFilter = App.state.quadrantFilter;
+    var quadSectors = (App.data.strategicQuadrants && App.data.strategicQuadrants.sectors) || null;
+    var QUAD_COLORS = { blue_ocean: '#3b82f6', battleground: '#ef4444', frontier: '#a78bfa', crowded_niche: '#6b7280' };
+    var QUAD_LABELS = { blue_ocean: 'Blue Ocean', battleground: 'Battleground', frontier: 'Frontier', crowded_niche: 'Crowded Niche' };
+
+    function makeRow(cells, lat, lng, dimmed) {
       var tr = document.createElement('tr');
       tr.innerHTML = cells;
       tr.style.cursor = 'pointer';
+      if (dimmed) tr.style.opacity = '0.2';
       tr.addEventListener('click', function() {
         MapModule.map.setView([lat, lng], 14);
         MapModule.highlightLocation(lat, lng);
@@ -331,13 +377,68 @@ const UIModule = {
       return tr;
     }
 
+    var compSectors = (App.data.competitiveCoverage && App.data.competitiveCoverage.sectors) || null;
+    var matchCount = 0;
+    var totalCount = Math.min(optPlacements.length, 50);
+
+    // Build covered set once for coverage badges
+    var coveredSetForTable = new Set();
+    if (App.state.coverageResults) {
+      App.state.coverageResults.covered.forEach(function(c) { coveredSetForTable.add(c.sc); });
+    }
+
     optPlacements.slice(0, 50).forEach(function(p, i) {
+      // Gap badge
+      var gapBadge = '';
+      if (compSectors && p.sc && compSectors[p.sc]) {
+        var gap = compSectors[p.sc].gap;
+        var cls = gap >= 1.0 ? 'gap-greenfield' : gap >= 0.7 ? 'gap-moderate' : gap >= 0.3 ? 'gap-competitive' : 'gap-saturated';
+        var title = compSectors[p.sc].cc + ' competitor(s), ' + compSectors[p.sc].oc + ' operator(s)';
+        gapBadge = '<span class="comp-badge ' + cls + '" title="' + title + '"></span>';
+      }
+
+      // Quadrant badge
+      var quadBadge = '';
+      var pQuad = quadSectors ? quadSectors[p.sc] : null;
+      if (pQuad && QUAD_COLORS[pQuad]) {
+        quadBadge = '<span class="quad-badge" style="background:' + QUAD_COLORS[pQuad] + '" title="' + (QUAD_LABELS[pQuad] || pQuad) + '"></span>';
+      }
+
+      // Coverage badge
+      var covBadge = '';
+      if (p.sc) {
+        var isSectorCovered = coveredSetForTable.has(p.sc);
+        covBadge = isSectorCovered
+          ? '<span class="cov-badge covered" title="Already covered by existing bbox">&#10003;</span>'
+          : '<span class="cov-badge uncovered" title="Uncovered — new opportunity">&#9679;</span>';
+      }
+
+      // Filter dimming
+      var dimmed = false;
+      if (quadFilter && pQuad !== quadFilter) {
+        dimmed = true;
+      } else if (quadFilter) {
+        matchCount++;
+      }
+
       tbody.appendChild(makeRow(
-        '<td>' + (i + 1) + '</td><td>' + (p.sc || '') + '</td><td>' +
+        '<td>' + (i + 1) + '</td><td>' + gapBadge + quadBadge + covBadge + (p.sc || '') + '</td><td>' +
         p.gain.toLocaleString() + '</td><td>' + p.cum.toFixed(1) + '%</td>',
-        p.lat, p.lng
+        p.lat, p.lng, dimmed
       ));
     });
+
+    // Filter summary
+    var summaryEl = document.getElementById('planner-filter-summary');
+    if (summaryEl) {
+      if (quadFilter && QUAD_LABELS[quadFilter]) {
+        summaryEl.style.display = '';
+        summaryEl.textContent = matchCount + ' ' + QUAD_LABELS[quadFilter] + ' placement' +
+          (matchCount !== 1 ? 's' : '') + ' (of ' + totalCount + ' shown)';
+      } else {
+        summaryEl.style.display = 'none';
+      }
+    }
 
     if (smPlacements && smPlacements.length > 0) {
       var divider = document.createElement('tr');
@@ -348,10 +449,229 @@ const UIModule = {
         tbody.appendChild(makeRow(
           '<td>' + (i + 1) + '</td><td>' + (s.name || 'Unknown') + '</td><td>' +
           s.gain.toLocaleString() + '</td><td>' + s.cum.toFixed(1) + '%</td>',
-          s.lat, s.lng
+          s.lat, s.lng, false
         ));
       });
     }
+  },
+
+  setupCompetitorPanel() {
+    if (!App.data.competitors) return;
+
+    var masterCheckbox = document.getElementById('show-competitors');
+    var togglesDiv = document.getElementById('competitor-operator-toggles');
+    var statsDiv = document.getElementById('competitor-stats');
+    var colorModeGroup = document.getElementById('sector-color-mode-group');
+    var legendComp = document.getElementById('legend-comp');
+    var legendGapGreen = document.getElementById('legend-gap-greenfield');
+    var legendGapSat = document.getElementById('legend-gap-saturated');
+    var opGrid = document.getElementById('comp-op-grid');
+    var self = this;
+
+    // Count operators
+    var opCounts = {};
+    for (var i = 0; i < App.data.competitors.length; i++) {
+      var op = App.data.competitors[i].operator;
+      opCounts[op] = (opCounts[op] || 0) + 1;
+    }
+
+    // Sort by count descending
+    var ops = Object.keys(opCounts).sort(function(a, b) { return opCounts[b] - opCounts[a]; });
+
+    // Build operator checkboxes
+    var COLORS = MapModule.COMPETITOR_COLORS;
+    ops.forEach(function(op) {
+      var colors = COLORS[op] || COLORS.other;
+      var label = document.createElement('label');
+      label.className = 'comp-op-label';
+      label.innerHTML =
+        '<input type="checkbox" class="comp-op-checkbox" data-operator="' + op + '" checked>' +
+        '<span class="comp-op-dot" style="background:' + colors.fill + '"></span>' +
+        op + ' (' + opCounts[op] + ')';
+      opGrid.appendChild(label);
+
+      label.querySelector('input').addEventListener('change', function() {
+        MapModule.toggleCompetitorOperator(op, this.checked);
+      });
+    });
+
+    // Master toggle
+    masterCheckbox.addEventListener('change', function() {
+      var checked = masterCheckbox.checked;
+      App.state.showCompetitors = checked;
+      togglesDiv.style.display = checked ? '' : 'none';
+      statsDiv.style.display = checked ? '' : 'none';
+      legendComp.style.display = checked ? '' : 'none';
+
+      // Show color mode group if competitors OR strategic data loaded
+      var hasStrategic = !!App.data.strategicQuadrants;
+      colorModeGroup.style.display = (checked || hasStrategic) ? '' : 'none';
+
+      MapModule.toggleCompetitors(checked);
+
+      if (checked) {
+        self.updateCompetitorStats();
+      } else {
+        // If on competitive mode, switch to strategic (if available) or coverage
+        if (App.state.sectorColorMode === 'competitive') {
+          var newMode = hasStrategic ? 'strategic' : 'coverage';
+          App.state.sectorColorMode = newMode;
+          MapModule.setSectorColorMode(newMode);
+          document.querySelectorAll('[data-sector-mode]').forEach(function(b) { b.classList.remove('active'); });
+          document.getElementById('sc-mode-' + newMode).classList.add('active');
+          self._updateGapLegend(false);
+          self._updateStrategicLegend(newMode === 'strategic');
+        }
+      }
+    });
+
+    // Sector color mode toggle
+    var scModeBtns = document.querySelectorAll('[data-sector-mode]');
+    scModeBtns.forEach(function(btn) {
+      btn.addEventListener('click', function() {
+        var mode = btn.getAttribute('data-sector-mode');
+        App.state.sectorColorMode = mode;
+        scModeBtns.forEach(function(b) { b.classList.remove('active'); });
+        btn.classList.add('active');
+
+        // When switching away from strategic, clear quadrant filter
+        if (mode !== 'strategic') {
+          App.state.quadrantFilter = null;
+          document.querySelectorAll('.quadrant-card').forEach(function(c) { c.classList.remove('active'); });
+          var resetBtn = document.getElementById('quadrant-reset');
+          var filterNote = document.getElementById('quadrant-filter-note');
+          if (resetBtn) resetBtn.style.display = 'none';
+          if (filterNote) filterNote.style.display = 'none';
+        }
+
+        MapModule.setSectorColorMode(mode);
+
+        // Toggle legend items per mode
+        self._updateGapLegend(mode === 'competitive');
+        self._updateStrategicLegend(mode === 'strategic');
+
+        // Update planner if filter changed
+        self.updatePlannerResults();
+      });
+    });
+  },
+
+  setupStrategicPanel() {
+    if (!App.data.strategicQuadrants) return;
+
+    var quadrants = App.data.strategicQuadrants;
+    var header = document.getElementById('strategic-header');
+    var panel = document.getElementById('strategic-panel');
+    var colorModeGroup = document.getElementById('sector-color-mode-group');
+
+    // Show the panel and color mode toggle
+    header.style.display = '';
+    panel.style.display = '';
+    colorModeGroup.style.display = '';
+
+    // Populate quadrant stats
+    var summary = quadrants.summary;
+    var QUAD_LABELS = {
+      blue_ocean: 'Blue Ocean',
+      battleground: 'Battleground',
+      frontier: 'Frontier',
+      crowded_niche: 'Crowded Niche',
+    };
+
+    ['blue_ocean', 'battleground', 'frontier', 'crowded_niche'].forEach(function(q) {
+      var el = document.getElementById('q-' + q);
+      if (el && summary[q]) {
+        el.textContent = summary[q].count.toLocaleString() + ' sectors · ' +
+          summary[q].uncoveredPop.toLocaleString() + ' uncovered pop';
+      }
+    });
+
+    // Click handlers for quadrant cards
+    var cards = document.querySelectorAll('.quadrant-card');
+    var resetBtn = document.getElementById('quadrant-reset');
+    var filterNote = document.getElementById('quadrant-filter-note');
+    var self = this;
+
+    cards.forEach(function(card) {
+      card.addEventListener('click', function() {
+        var q = card.getAttribute('data-quadrant');
+
+        if (App.state.quadrantFilter === q) {
+          // Deselect — show all quadrants
+          App.state.quadrantFilter = null;
+          cards.forEach(function(c) { c.classList.remove('active'); });
+          resetBtn.style.display = 'none';
+          filterNote.style.display = 'none';
+        } else {
+          // Select this quadrant
+          App.state.quadrantFilter = q;
+          cards.forEach(function(c) { c.classList.remove('active'); });
+          card.classList.add('active');
+          resetBtn.style.display = '';
+          filterNote.style.display = '';
+          filterNote.textContent = 'Filtering placements to ' + QUAD_LABELS[q] + ' sectors';
+        }
+
+        // Activate strategic coloring mode
+        App.state.sectorColorMode = 'strategic';
+        document.querySelectorAll('[data-sector-mode]').forEach(function(b) { b.classList.remove('active'); });
+        var stratBtn = document.getElementById('sc-mode-strategic');
+        if (stratBtn) stratBtn.classList.add('active');
+        MapModule.setSectorColorMode('strategic');
+
+        // Toggle legend items
+        self._updateStrategicLegend(true);
+        self._updateGapLegend(false);
+
+        // Update planner table with filter
+        self.updatePlannerResults();
+      });
+    });
+
+    resetBtn.addEventListener('click', function() {
+      App.state.quadrantFilter = null;
+      cards.forEach(function(c) { c.classList.remove('active'); });
+      resetBtn.style.display = 'none';
+      filterNote.style.display = 'none';
+      MapModule.setSectorColorMode('strategic');
+      self.updatePlannerResults();
+    });
+
+    // "Hide covered sectors" toggle
+    var hideCovCheckbox = document.getElementById('strategic-hide-covered');
+    if (hideCovCheckbox) {
+      hideCovCheckbox.addEventListener('change', function() {
+        App.state.strategicHideCovered = hideCovCheckbox.checked;
+        if (App.state.sectorColorMode === 'strategic') {
+          MapModule.setSectorColorMode('strategic');
+        }
+      });
+    }
+  },
+
+  _updateStrategicLegend(show) {
+    ['legend-q-blue', 'legend-q-battle', 'legend-q-frontier', 'legend-q-crowded',
+     'legend-q-uncovered', 'legend-q-covered'].forEach(function(id) {
+      var el = document.getElementById(id);
+      if (el) el.style.display = show ? '' : 'none';
+    });
+  },
+
+  _updateGapLegend(show) {
+    ['legend-gap-greenfield', 'legend-gap-saturated'].forEach(function(id) {
+      var el = document.getElementById(id);
+      if (el) el.style.display = show ? '' : 'none';
+    });
+  },
+
+  updateCompetitorStats() {
+    if (!App.data.competitiveCoverage) return;
+    var stats = App.data.competitiveCoverage.stats;
+    var meta = App.data.competitiveCoverage.meta;
+    document.getElementById('stat-comp-total').textContent =
+      meta.totalCompetitors.toLocaleString();
+    document.getElementById('stat-comp-sectors').textContent =
+      stats.coveredByAny.toLocaleString() + ' / ' + meta.totalSectors.toLocaleString();
   },
 
   exportCSV() {
