@@ -170,10 +170,11 @@ def generate_pdf(report_path):
     for cand in candidates:
         site = cand.get("suggested_site", {})
         verdict = cand.get("physical_feasibility", {}).get("verdict", "")
-        score = cand.get("site_score") or cand.get("gt_score", 0)
-        site_name = site.get("name", "Unknown")
-        site_type = site.get("type", "")
-        dist = site.get("dist_m", 0)
+        ml_score = cand.get("ml_score")
+        site_score = cand.get("site_score") or cand.get("gt_score", 0)
+        site_name = site.get("name", "Unknown") if site else "Unknown"
+        site_type = site.get("type", "") if site else ""
+        dist = site.get("dist_m", 0) if site else 0
 
         # Number
         pdf.set_font("Helvetica", "B", 9)
@@ -197,10 +198,13 @@ def generate_pdf(report_path):
             pdf.set_font("Helvetica", "", 8)
             pdf.cell(25, 5, sanitize(verdict))
 
-        # Score
+        # Score (ML or legacy)
         pdf.set_font("Helvetica", "", 8)
         pdf.set_text_color(75, 85, 99)
-        pdf.cell(0, 5, f"Score: {score}")
+        if ml_score is not None:
+            pdf.cell(0, 5, f"ML: {ml_score:.4f}")
+        else:
+            pdf.cell(0, 5, f"Score: {site_score}")
         pdf.ln(5)
 
     pdf.ln(4)
@@ -248,25 +252,41 @@ def generate_pdf(report_path):
     for cand in candidates:
         pdf.add_page()
 
-        bd = cand["breakdown"]
-        score = cand.get("site_score") or cand.get("gt_score", 0)
+        ml_score = cand.get("ml_score")
+        bd = cand.get("breakdown", {})
+        site_score = cand.get("site_score") or cand.get("gt_score", 0)
         explanations = cand.get("score_explanations", {})
+        has_ml = ml_score is not None
 
-        # Color coding
-        if score >= 70:
-            pdf.set_fill_color(220, 252, 231)
-            badge_color = (22, 163, 74)
-        elif score >= 40:
-            pdf.set_fill_color(254, 249, 195)
-            badge_color = (161, 98, 7)
+        # Color coding based on ml_score or site_score
+        if has_ml:
+            if ml_score >= 0.5:
+                pdf.set_fill_color(220, 252, 231)
+                badge_color = (22, 163, 74)
+            elif ml_score >= 0.2:
+                pdf.set_fill_color(254, 249, 195)
+                badge_color = (161, 98, 7)
+            else:
+                pdf.set_fill_color(254, 226, 226)
+                badge_color = (220, 38, 38)
         else:
-            pdf.set_fill_color(254, 226, 226)
-            badge_color = (220, 38, 38)
+            if site_score >= 70:
+                pdf.set_fill_color(220, 252, 231)
+                badge_color = (22, 163, 74)
+            elif site_score >= 40:
+                pdf.set_fill_color(254, 249, 195)
+                badge_color = (161, 98, 7)
+            else:
+                pdf.set_fill_color(254, 226, 226)
+                badge_color = (220, 38, 38)
 
         # Score badge + header
         pdf.set_font("Helvetica", "B", 12)
         pdf.set_text_color(*badge_color)
-        pdf.cell(24, 8, sanitize(f"Score {score}"), border=0, fill=True, align="C")
+        if has_ml:
+            pdf.cell(30, 8, sanitize(f"ML {ml_score:.4f}"), border=0, fill=True, align="C")
+        else:
+            pdf.cell(24, 8, sanitize(f"Score {site_score}"), border=0, fill=True, align="C")
         pdf.set_text_color(17, 24, 39)
         pdf.cell(4, 8, "")
         pdf.set_font("Helvetica", "B", 12)
@@ -402,27 +422,59 @@ def generate_pdf(report_path):
         pdf.cell(0, 4, "  |  ".join(metrics))
         pdf.ln(6)
 
-        # Score breakdown bars with explanation notes
-        for label, score_val, max_s, expl_key in [
-            ("Transit", bd["transit"], 25, "transit"),
-            ("Commerce", bd["commerce"], 30, "commerce"),
-            ("Building", bd["building"], 20, "building"),
-            ("Pedestrian", bd["pedestrian"], 15, "pedestrian"),
-            ("Parking", bd["parking"], 10, "parking"),
-        ]:
-            pdf.set_font("Helvetica", "", 8)
-            pdf.set_text_color(75, 85, 99)
-            pdf.cell(22, 5, label)
-            pdf.score_bar(score_val, max_s, width=30)
-            explanation = explanations.get(expl_key, "")
-            if explanation:
-                pdf.set_font("Helvetica", "I", 7)
-                pdf.set_text_color(107, 114, 128)
-                max_chars = 70
-                if len(explanation) > max_chars:
-                    explanation = explanation[:max_chars - 3] + "..."
-                pdf.cell(0, 5, sanitize(explanation))
+        # Location context (ML mode) or score breakdown bars (legacy mode)
+        loc_ctx = cand.get("location_context", {})
+        if has_ml and loc_ctx:
+            pdf.set_font("Helvetica", "B", 8)
+            pdf.set_text_color(55, 65, 81)
+            pdf.cell(0, 5, "Location Context:")
             pdf.ln(5)
+            ctx_items = [
+                ("Transit", f"{loc_ctx.get('transit', {}).get('bus_stops_300m', 0)} bus stops (300m), "
+                            f"{loc_ctx.get('transit', {}).get('rail_tram_500m', 0)} rail/tram (500m)"),
+                ("Commerce", f"{loc_ctx.get('commerce', {}).get('shops_300m', 0)} shops/amenities (300m)"),
+                ("Parking", f"{loc_ctx.get('parking', {}).get('spots_200m', 0)} facilities (200m)"),
+                ("Pedestrian", f"{loc_ctx.get('pedestrian', {}).get('footways_150m', 0)} footways (150m)"),
+            ]
+            for label, desc in ctx_items:
+                pdf.set_font("Helvetica", "", 8)
+                pdf.set_text_color(75, 85, 99)
+                pdf.cell(22, 5, label)
+                pdf.set_font("Helvetica", "", 8)
+                pdf.set_text_color(30, 30, 30)
+                pdf.cell(0, 5, sanitize(desc))
+                pdf.ln(5)
+            # Named POIs from location_context
+            for ctx_key in ["transit", "commerce"]:
+                details = loc_ctx.get(ctx_key, {}).get("details", [])
+                if details:
+                    pdf.set_font("Helvetica", "I", 7)
+                    pdf.set_text_color(107, 114, 128)
+                    detail_strs = [f"{d['name']} ({d['type']}, {d['dist_m']}m)" for d in details[:4]]
+                    pdf.cell(0, 4, sanitize(f"  {', '.join(detail_strs)}"))
+                    pdf.ln(4)
+        elif bd:
+            # Legacy: Score breakdown bars with explanation notes
+            for label, score_val, max_s, expl_key in [
+                ("Transit", bd.get("transit", 0), 25, "transit"),
+                ("Commerce", bd.get("commerce", 0), 30, "commerce"),
+                ("Building", bd.get("building", 0), 20, "building"),
+                ("Pedestrian", bd.get("pedestrian", 0), 15, "pedestrian"),
+                ("Parking", bd.get("parking", 0), 10, "parking"),
+            ]:
+                pdf.set_font("Helvetica", "", 8)
+                pdf.set_text_color(75, 85, 99)
+                pdf.cell(22, 5, label)
+                pdf.score_bar(score_val, max_s, width=30)
+                explanation = explanations.get(expl_key, "")
+                if explanation:
+                    pdf.set_font("Helvetica", "I", 7)
+                    pdf.set_text_color(107, 114, 128)
+                    max_chars = 70
+                    if len(explanation) > max_chars:
+                        explanation = explanation[:max_chars - 3] + "..."
+                    pdf.cell(0, 5, sanitize(explanation))
+                pdf.ln(5)
 
         pdf.ln(2)
 
@@ -511,7 +563,21 @@ def generate_pdf(report_path):
 
     # --- Scoring Methodology ---
     pdf.ln(6)
-    pdf.section_title("Scoring Methodology")
+    ml_available = meta.get("ml_heatmap_available", False)
+    if ml_available:
+        pdf.section_title("Scoring Methodology (ML Heatmap)")
+        pdf.set_font("Helvetica", "", 9)
+        pdf.set_text_color(30, 30, 30)
+        pdf.multi_cell(0, 5, sanitize(
+            "Candidates are sourced from ML heatmap peaks (XGBoost, AUC 0.94) trained on "
+            "Brussels + Wallonia locker locations. The model scores 3.1M grid points at 100m resolution "
+            "using micro-location features: proximity to supermarkets, competitors, shops, transit, "
+            "and parking. Ranking is by ml_score descending (relative to local area — no absolute threshold). "
+            "OSM data provides location context for each peak (transit, commerce, parking, pedestrian counts)."
+        ))
+        pdf.ln(4)
+    else:
+        pdf.section_title("Scoring Methodology (OSM Fallback)")
 
     col_widths = [25, 15, 12, 120]
     headers = ["Criterion", "Weight", "Max", "Logic"]
@@ -523,18 +589,19 @@ def generate_pdf(report_path):
         ("Parking", "10%", "10", "Within 200m: 0->0, 1->7, 2+->10"),
     ]
 
-    pdf.set_font("Helvetica", "B", 8)
-    pdf.set_fill_color(243, 244, 246)
-    pdf.set_text_color(30, 30, 30)
-    for h, w in zip(headers, col_widths):
-        pdf.cell(w, 6, h, border=1, fill=True, align="C")
-    pdf.ln()
-
-    pdf.set_font("Helvetica", "", 8)
-    for row in rows:
-        for j, (cell, w) in enumerate(zip(row, col_widths)):
-            pdf.cell(w, 5, cell, border=1, align="C" if j < 3 else "L")
+    if not ml_available:
+        pdf.set_font("Helvetica", "B", 8)
+        pdf.set_fill_color(243, 244, 246)
+        pdf.set_text_color(30, 30, 30)
+        for h, w in zip(headers, col_widths):
+            pdf.cell(w, 6, h, border=1, fill=True, align="C")
         pdf.ln()
+
+        pdf.set_font("Helvetica", "", 8)
+        for row in rows:
+            for j, (cell, w) in enumerate(zip(row, col_widths)):
+                pdf.cell(w, 5, cell, border=1, align="C" if j < 3 else "L")
+            pdf.ln()
 
     # --- Appendix A: Research Artifacts ---
     pdf.add_page()
