@@ -17,6 +17,10 @@ data/supermarkets_raw.json
 .DS_Store
 .vscode/
 
+# Python
+__pycache__/
+*.pyc
+
 # Environment secrets
 .env
 
