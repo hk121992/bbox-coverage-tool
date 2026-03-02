@@ -1468,6 +1468,202 @@ def download_candidate_images(candidates, img_dir):
         time.sleep(0.2)
 
 
+# --- Street View corridor (ML-guided) ---
+
+def build_sv_corridor(sector_code, hot_thresh=0.60, corridor_thresh=0.45, spacing_m=22):
+    """Build a Street View API corridor through the ML hot zone of a sector.
+
+    Finds all grid cells scoring >= hot_thresh, chooses the anchor ordering that
+    maximises the average IDW score along the corridor between them, interpolates
+    sample points every spacing_m metres, and returns two headed API calls (left /
+    right of travel direction) per point that scores >= corridor_thresh.
+
+    Returns a dict with keys: meta, anchor_order, corridor_points, sv_calls.
+    Returns None if ml_heatmap.parquet is missing or the sector has no hot points.
+    """
+    heatmap_path = DATA_DIR / "ml_heatmap.parquet"
+    if not heatmap_path.exists():
+        print("  build_sv_corridor: ml_heatmap.parquet not found, skipping")
+        return None
+
+    try:
+        import pandas as pd
+        import itertools
+    except ImportError:
+        print("  build_sv_corridor: pandas not available, skipping")
+        return None
+
+    df  = pd.read_parquet(heatmap_path)
+    sec = df[df["sc"] == sector_code].copy().reset_index(drop=True)
+
+    if sec.empty:
+        print(f"  build_sv_corridor: no ML data for sector {sector_code}, skipping")
+        return None
+
+    def _idw(lat, lng, power=2):
+        d2 = (sec["lat"] - lat) ** 2 + (sec["lng"] - lng) ** 2
+        w  = 1.0 / (d2 + 1e-12) ** power
+        return float((w * sec["score"]).sum() / w.sum())
+
+    def _bearing(lat1, lng1, lat2, lng2):
+        dL = (lng2 - lng1) * DEG_TO_RAD
+        x  = math.cos(lat2 * DEG_TO_RAD) * math.sin(dL)
+        y  = (math.cos(lat1 * DEG_TO_RAD) * math.sin(lat2 * DEG_TO_RAD)
+              - math.sin(lat1 * DEG_TO_RAD) * math.cos(lat2 * DEG_TO_RAD) * math.cos(dL))
+        return (math.atan2(x, y) / DEG_TO_RAD) % 360
+
+    hot = sec[sec["score"] >= hot_thresh].copy()
+    if len(hot) < 2:
+        print(f"  build_sv_corridor: <2 anchors at score >= {hot_thresh}, skipping")
+        return None
+
+    # Best linear ordering through anchors (maximise corridor IDW)
+    def _score_order(order):
+        pts = [hot.iloc[i] for i in order]
+        mids = [_idw((pts[i]["lat"] + pts[i+1]["lat"]) / 2,
+                     (pts[i]["lng"] + pts[i+1]["lng"]) / 2)
+                for i in range(len(pts) - 1)]
+        return sum(mids) / len(mids)
+
+    best_order, best_score = max(
+        ((p, _score_order(p)) for p in itertools.permutations(range(len(hot)))),
+        key=lambda x: x[1])
+    anchors = [hot.iloc[i] for i in best_order]
+
+    # Interpolate sample points
+    all_pts = []
+    for i in range(len(anchors) - 1):
+        a, b   = anchors[i], anchors[i + 1]
+        alat, alng = float(a["lat"]), float(a["lng"])
+        blat, blng = float(b["lat"]), float(b["lng"])
+        total_m    = haversine(alat, alng, blat, blng)
+        n_steps    = max(1, int(total_m / spacing_m))
+        bear = _bearing(alat, alng, blat, blng)
+        hl   = (bear - 90) % 360
+        hr   = (bear + 90) % 360
+        for j in range(n_steps + 1):
+            t   = j / n_steps
+            lat = alat + t * (blat - alat)
+            lng = alng + t * (blng - alng)
+            all_pts.append({
+                "lat": round(lat, 7), "lng": round(lng, 7),
+                "idw_score": round(_idw(lat, lng), 4),
+                "head_left": round(hl, 1), "head_right": round(hr, 1),
+                "travel_bearing": round(bear, 1), "is_anchor": False,
+            })
+
+    # Deduplicate (< 5 m apart)
+    deduped = []
+    for p in all_pts:
+        if not any(haversine(p["lat"], p["lng"], q["lat"], q["lng"]) < 5
+                   for q in deduped):
+            deduped.append(p)
+
+    # Flag anchor positions
+    for a in anchors:
+        alat, alng = float(a["lat"]), float(a["lng"])
+        for p in deduped:
+            if abs(p["lat"] - alat) < 1e-5 and abs(p["lng"] - alng) < 1e-5:
+                p["is_anchor"] = True
+                p["anchor_score"] = round(float(a["score"]), 4)
+                break
+
+    # Filter to hot corridor
+    corridor = [p for p in deduped if p["idw_score"] >= corridor_thresh]
+    if not corridor:
+        print(f"  build_sv_corridor: no points above corridor_thresh {corridor_thresh}, skipping")
+        return None
+
+    sv_calls = [
+        {"lat": p["lat"], "lng": p["lng"], "heading": h,
+         "pitch": 5, "fov": 90, "idw_score": p["idw_score"],
+         "side": side, "is_anchor": p.get("is_anchor", False)}
+        for p in corridor
+        for side, h in [("left", p["head_left"]), ("right", p["head_right"])]
+    ]
+
+    print(f"  SV corridor: {len(anchors)} anchors → {len(corridor)} viewpoints "
+          f"→ {len(sv_calls)} calls (corridor avg IDW={best_score:.3f})")
+
+    return {
+        "meta": {
+            "sector": sector_code,
+            "hot_threshold": hot_thresh,
+            "corridor_threshold": corridor_thresh,
+            "sample_spacing_m": spacing_m,
+            "n_anchors": len(anchors),
+            "n_viewpoints": len(corridor),
+            "n_sv_calls": len(sv_calls),
+            "corridor_avg_idw": round(best_score, 4),
+        },
+        "anchor_order": [
+            {"lat": float(a["lat"]), "lng": float(a["lng"]), "score": float(a["score"])}
+            for a in anchors
+        ],
+        "corridor_points": corridor,
+        "sv_calls": sv_calls,
+    }
+
+
+def download_sv_corridor_images(sv_calls, img_dir):
+    """Download Street View images for every call in the ML corridor.
+
+    Images are saved as sv_corridor_{n}_left.png / sv_corridor_{n}_right.png.
+    Skips quietly if no Google Maps API key is configured.
+    """
+    try:
+        from dotenv import load_dotenv
+        load_dotenv(Path(__file__).resolve().parent.parent / ".env", override=True)
+    except ImportError:
+        pass
+
+    api_key = os.getenv("GOOGLE_MAPS_API_KEY")
+    if not api_key:
+        print("  download_sv_corridor_images: no GOOGLE_MAPS_API_KEY, skipping")
+        return
+
+    print(f"  Downloading {len(sv_calls)} corridor Street View images...")
+    counters = {}   # (lat, lng) → per-position index for filename
+    saved = 0
+
+    for call in sv_calls:
+        lat, lng    = call["lat"], call["lng"]
+        heading     = call["heading"]
+        side        = call["side"]
+        pos_key     = (lat, lng)
+        counters[pos_key] = counters.get(pos_key, 0) + 1
+        n           = counters[pos_key]
+
+        # Check availability
+        meta_url = (f"https://maps.googleapis.com/maps/api/streetview/metadata?"
+                    f"location={lat},{lng}&key={api_key}")
+        try:
+            req  = urllib.request.Request(meta_url, headers=HEADERS)
+            meta = json.loads(urllib.request.urlopen(req, timeout=10).read().decode())
+            if meta.get("status") != "OK":
+                continue
+        except Exception:
+            continue
+
+        sv_url = (f"https://maps.googleapis.com/maps/api/streetview?"
+                  f"size=800x600&location={lat},{lng}"
+                  f"&heading={heading}&pitch={call.get('pitch', 5)}"
+                  f"&fov={call.get('fov', 90)}&key={api_key}")
+        fname  = img_dir / f"sv_corridor_{n}_{side}.png"
+        try:
+            req2  = urllib.request.Request(sv_url, headers=HEADERS)
+            resp2 = urllib.request.urlopen(req2, timeout=15)
+            with open(fname, "wb") as fh:
+                fh.write(resp2.read())
+            saved += 1
+        except Exception as e:
+            print(f"    corridor SV {n}_{side}: download failed: {e}")
+
+        time.sleep(0.15)
+
+    print(f"  Corridor images saved: {saved}/{len(sv_calls)}")
+
+
 def _download_esri_tiles(candidates, img_dir):
     """Fallback: download ESRI satellite tiles with center marker."""
     print("Step 6: Downloading ESRI satellite tiles (fallback)...")
@@ -1953,7 +2149,7 @@ IMPORTANT for visual_observations: Include 3-5 observations per candidate based 
 
 def generate_report(center, radius_km, travel_time, candidates, zoning, data,
                     area_name, osm_counts=None, ai_enrichment=None, target_sector=None,
-                    report_dir=None, sector_summary=None):
+                    report_dir=None, sector_summary=None, sv_corridor=None):
     print("Step 8: Generating report...")
 
     ml_heatmap_available = data.get("ml_heatmap") is not None
@@ -1996,6 +2192,7 @@ def generate_report(center, radius_km, travel_time, candidates, zoning, data,
             "target_sector": target_sector or "",
             "sector_summary": sector_summary or {},
             "ml_heatmap_available": ml_heatmap_available,
+            "sv_corridor": sv_corridor or {},
         },
         "candidates": candidates,
         "zoning_research": {k: v for k, v in zoning.items() if k != "research_prompts"},
@@ -2116,6 +2313,13 @@ def main():
     download_candidate_images(scored, img_dir)
     download_overview_image(center, scored, img_dir)
 
+    # Step 6b: Build ML corridor + download Street View sweep (sector mode only)
+    sv_corridor = None
+    if args.sector:
+        sv_corridor = build_sv_corridor(args.sector)
+        if sv_corridor:
+            download_sv_corridor_images(sv_corridor["sv_calls"], img_dir)
+
     # Step 7 (optional): Claude API enrichment with feasibility iteration
     ai_enrichment = None
     if args.enrich:
@@ -2207,7 +2411,8 @@ def main():
     osm_counts = {cat: len(feats) for cat, feats in osm_features.items()}
     generate_report(center, args.radius, args.travel_time, scored, zoning, data,
                     area_name, osm_counts, ai_enrichment, target_sector=args.sector,
-                    report_dir=report_dir, sector_summary=sector_summary)
+                    report_dir=report_dir, sector_summary=sector_summary,
+                    sv_corridor=sv_corridor)
 
 
 if __name__ == "__main__":
