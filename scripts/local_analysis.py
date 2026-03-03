@@ -19,6 +19,8 @@ Output: data/local_reports/{name}_{date}/report.json
 """
 
 import argparse
+import hashlib
+import heapq
 import json
 import math
 import os
@@ -28,7 +30,8 @@ import urllib.parse
 from collections import defaultdict
 from pathlib import Path
 
-DATA_DIR = Path(__file__).resolve().parent.parent / "data"
+DATA_DIR  = Path(__file__).resolve().parent.parent / "data"
+CACHE_DIR = Path(__file__).resolve().parent.parent / "cache"
 REPORTS_DIR = DATA_DIR / "local_reports"
 
 # --- Constants ---
@@ -52,6 +55,35 @@ PLANNING_PORTALS = {
         "base": "https://lampspw.wallonie.be/dgo4/site_amenagement",
         "permits": "https://lampspw.wallonie.be/dgo4/site_amenagement/permis",
     },
+}
+
+SV_ANALYSIS_VERSION = "2.0"
+
+# --- SV Pipeline v2.0 Configuration ---
+# All tuning knobs in one place for rapid experimentation.
+SV_CONFIG = {
+    "screening_stride": 3,          # take every Nth corridor point for screening
+    "screening_threshold": 4,       # min placement_score to flag as "interesting"
+    "detail_fov_set": [60, 90, 120],  # FOVs for detail capture
+    "look_toward_range": 2,         # ±N adjacent viewpoints for converging views
+    "clustering_radius_m": 35,      # how close VPs must be to form a candidate group
+    "max_images_per_candidate": 12, # cap images sent to Opus per candidate group
+    "candidate_min_score": 5,       # min placement_score for candidate conversion
+    "opus_prompt_variant": "v1",    # swap to test different assessment prompts
+    "fallback_max_attempts": 3,     # max download fallback attempts per image
+    "fallback_offset_m": 5,         # offset distance for fallback position
+    "fallback_heading_delta": 20,   # heading rotation for fallback (degrees)
+    "fallback_pano_max_dist_m": 40, # max distance for nearby pano_id fallback
+    "source_outdoor": True,         # add source=outdoor to SV API (filters indoor panos)
+}
+
+# Locker size variants.  Source: 13m Ghent unit = 26 modules → ~0.5m/module;
+# depth/height estimated from industry norms.  Update when bpost confirms exact specs.
+LOCKER_SIZES = {
+    "compact":  {"w": 0.6, "d": 0.7, "h": 2.0, "clearance": 1.2},
+    "standard": {"w": 1.2, "d": 0.7, "h": 2.0, "clearance": 1.5},
+    "large":    {"w": 2.4, "d": 0.7, "h": 2.0, "clearance": 1.5},
+    "xl":       {"w": 4.8, "d": 0.7, "h": 2.0, "clearance": 2.0},
 }
 
 # POI types suitable as locker placement sites
@@ -158,6 +190,15 @@ def haversine(lat1, lng1, lat2, lng2):
          math.cos(lat1 * DEG_TO_RAD) * math.cos(lat2 * DEG_TO_RAD) *
          math.sin(d_lng / 2) ** 2)
     return R_EARTH * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
+
+def _bearing(lat1, lng1, lat2, lng2):
+    """Forward azimuth in degrees [0, 360) from point 1 to point 2."""
+    dL = (lng2 - lng1) * DEG_TO_RAD
+    x  = math.cos(lat2 * DEG_TO_RAD) * math.sin(dL)
+    y  = (math.cos(lat1 * DEG_TO_RAD) * math.sin(lat2 * DEG_TO_RAD)
+          - math.sin(lat1 * DEG_TO_RAD) * math.cos(lat2 * DEG_TO_RAD) * math.cos(dL))
+    return (math.atan2(x, y) / DEG_TO_RAD) % 360
 
 
 def build_spatial_index(points, key_lat="lat", key_lng="lng"):
@@ -1039,12 +1080,14 @@ def describe_candidates(candidates, osm_features, data, center=None):
         time.sleep(1.1)  # Nominatim rate limit
 
         ml_score = cand.get("ml_score", 0)
-        described.append({
+        # Start from original candidate dict to preserve sv_* and other fields
+        enriched = dict(cand)
+        enriched.update({
             "id": i + 1,
             "lat": round(lat, 5),
             "lng": round(lng, 5),
             "sector": cand.get("sector", ""),
-            "source": cand["source"],
+            "source": cand.get("source", "sv_corridor"),
             "ml_score": ml_score,
             "address": address,
             "suggested_site": suggested_site,
@@ -1053,10 +1096,11 @@ def describe_candidates(candidates, osm_features, data, center=None):
             "location_context": location_context,
             "nearby_pois": all_pois,
             "pop_gain": cand.get("pop_gain", 0),
-            "commentary": "",
-            "contact_info": "",
-            "status": "proposed",
+            "commentary": cand.get("commentary", ""),
+            "contact_info": cand.get("contact_info", ""),
+            "status": cand.get("status", "proposed"),
         })
+        described.append(enriched)
 
         site_hint = f" -> {suggested_site['name']}" if suggested_site else ""
         print(f"  #{i+1}: ML={ml_score:.4f} src={cand['source']}{site_hint} "
@@ -1453,7 +1497,7 @@ def download_candidate_images(candidates, img_dir):
             if meta.get("status") == "OK":
                 sv_url = (f"https://maps.googleapis.com/maps/api/streetview?"
                           f"size=800x600&location={lat},{lng}"
-                          f"&fov=90&pitch=10&key={api_key}")
+                          f"&fov=90&pitch=10&source=outdoor&key={api_key}")
                 sv_path = img_dir / f"candidate_{cid}_streetview.png"
                 req2 = urllib.request.Request(sv_url, headers=HEADERS)
                 resp2 = urllib.request.urlopen(req2, timeout=15)
@@ -1468,7 +1512,559 @@ def download_candidate_images(candidates, img_dir):
         time.sleep(0.2)
 
 
+# --- Street graph helpers (used by build_sv_corridor) ---
+
+def _fetch_street_graph(lat_min, lat_max, lng_min, lng_max):
+    """Fetch the walkable street network for a bounding box from Overpass, with cache.
+
+    Returns (nodes, graph):
+      nodes: {osm_node_id: (lat, lng)}
+      graph: {osm_node_id: [(neighbor_id, dist_m), ...]}  -- undirected
+
+    Returns ({}, {}) on any failure so the caller can fall back to straight-line routing.
+    """
+    cache_key = f"streets:{lat_min:.5f},{lat_max:.5f},{lng_min:.5f},{lng_max:.5f}"
+    cache_sha  = hashlib.sha1(cache_key.encode()).hexdigest()
+    cache_path = CACHE_DIR / f"{cache_sha}.json"
+
+    raw = None
+    if cache_path.exists():
+        try:
+            with open(cache_path) as fh:
+                raw = json.load(fh)
+            print(f"  _fetch_street_graph: cache hit ({cache_sha[:8]}…)")
+        except Exception as e:
+            print(f"  _fetch_street_graph: cache read error ({e}), re-fetching")
+            raw = None
+
+    if raw is None:
+        bbox_str = f"{lat_min:.5f},{lng_min:.5f},{lat_max:.5f},{lng_max:.5f}"
+        query = (
+            f"[out:json][timeout:25];\n"
+            f"(\n"
+            f'  way["highway"~"^(primary|secondary|tertiary|residential|unclassified'
+            f'|living_street|pedestrian)$"]({bbox_str});\n'
+            f'  way["highway"="service"]["service"!="driveway"]({bbox_str});\n'
+            f");\nout geom;"
+        )
+        try:
+            raw = overpass_query(query, retries=2)
+            if not raw.get("elements"):
+                print("  _fetch_street_graph: Overpass returned 0 elements")
+                return {}, {}
+            CACHE_DIR.mkdir(exist_ok=True)
+            with open(cache_path, "w") as fh:
+                json.dump(raw, fh)
+        except Exception as e:
+            print(f"  _fetch_street_graph: fetch failed ({e})")
+            return {}, {}
+
+    nodes  = {}
+    graph  = defaultdict(list)
+    for way in raw.get("elements", []):
+        if way.get("type") != "way":
+            continue
+        way_nids = way.get("nodes", [])
+        way_geom = way.get("geometry", [])
+        if len(way_nids) != len(way_geom) or len(way_nids) < 2:
+            continue
+        for i, nid in enumerate(way_nids):
+            g = way_geom[i]
+            nodes[nid] = (g["lat"], g["lon"])
+        # Build undirected edges (oneway ignored — pedestrian survey, not vehicle routing)
+        for i in range(len(way_nids) - 1):
+            a_id, b_id = way_nids[i], way_nids[i + 1]
+            g_a, g_b   = way_geom[i], way_geom[i + 1]
+            dist = haversine(g_a["lat"], g_a["lon"], g_b["lat"], g_b["lon"])
+            graph[a_id].append((b_id, dist))
+            graph[b_id].append((a_id, dist))
+
+    n_edges = sum(len(v) for v in graph.values())
+    print(f"  _fetch_street_graph: {len(nodes)} nodes, {n_edges} directed edges")
+    return nodes, dict(graph)
+
+
+def _route_on_graph(nodes, graph, from_lat, from_lng, to_lat, to_lng,
+                    max_snap_m=100):
+    """Dijkstra shortest path between two coordinates on the street graph.
+
+    Snaps each coordinate to the nearest graph node. Returns None if either
+    snap exceeds max_snap_m or no connected path exists.
+
+    Returns list of (lat, lng) tuples, or None.
+    """
+    if not nodes or not graph:
+        return None
+
+    def _snap(lat, lng):
+        best_id, best_dist = None, float("inf")
+        for nid, (nlat, nlng) in nodes.items():
+            d = haversine(lat, lng, nlat, nlng)
+            if d < best_dist:
+                best_dist, best_id = d, nid
+        return best_id, best_dist
+
+    from_id, from_snap = _snap(from_lat, from_lng)
+    to_id,   to_snap   = _snap(to_lat,   to_lng)
+
+    if from_snap > max_snap_m or to_snap > max_snap_m:
+        print(f"  _route_on_graph: snap too far "
+              f"({from_snap:.0f}m / {to_snap:.0f}m > {max_snap_m}m), fallback")
+        return None
+
+    if from_id == to_id:
+        nlat, nlng = nodes[from_id]
+        return [(nlat, nlng)]
+
+    dist_map = {from_id: 0.0}
+    prev_map = {}
+    pq = [(0.0, from_id)]
+    while pq:
+        d, u = heapq.heappop(pq)
+        if d > dist_map.get(u, float("inf")):
+            continue
+        if u == to_id:
+            break
+        for v, w in graph.get(u, []):
+            nd = d + w
+            if nd < dist_map.get(v, float("inf")):
+                dist_map[v] = nd
+                prev_map[v] = u
+                heapq.heappush(pq, (nd, v))
+
+    if to_id not in dist_map:
+        print("  _route_on_graph: no path found, fallback")
+        return None
+
+    path_ids = []
+    cur = to_id
+    while cur in prev_map:
+        path_ids.append(cur)
+        cur = prev_map[cur]
+    path_ids.append(from_id)
+    path_ids.reverse()
+    return [nodes[nid] for nid in path_ids]
+
+
+def _sample_path(waypoints, spacing_m=22):
+    """Sample a multi-segment path at regular intervals.
+
+    Walks the dense node sequence and emits one point every spacing_m metres.
+    Bearing is computed per segment so heading arrows are perpendicular to the
+    actual street direction at each viewpoint.
+
+    Returns list of {lat, lng, travel_bearing, head_left, head_right}.
+    """
+    if len(waypoints) < 2:
+        return []
+
+    samples = []
+    carry   = 0.0  # metres already consumed toward the next spacing window
+
+    for i in range(len(waypoints) - 1):
+        lat1, lng1 = waypoints[i]
+        lat2, lng2 = waypoints[i + 1]
+        seg_len = haversine(lat1, lng1, lat2, lng2)
+        if seg_len < 0.001:
+            continue  # skip degenerate / duplicate nodes
+
+        bear = _bearing(lat1, lng1, lat2, lng2)
+        hl   = (bear - 90) % 360
+        hr   = (bear + 90) % 360
+        next_in_seg = spacing_m - carry
+
+        while next_in_seg <= seg_len:
+            frac = next_in_seg / seg_len
+            samples.append({
+                "lat":            round(lat1 + frac * (lat2 - lat1), 7),
+                "lng":            round(lng1 + frac * (lng2 - lng1), 7),
+                "travel_bearing": round(bear, 1),
+                "head_left":      round(hl, 1),
+                "head_right":     round(hr, 1),
+            })
+            next_in_seg += spacing_m
+
+        carry = seg_len - (next_in_seg - spacing_m)
+
+    # Always ensure the first waypoint is represented
+    lat0, lng0 = waypoints[0]
+    if not samples or haversine(lat0, lng0, samples[0]["lat"], samples[0]["lng"]) > 1.0:
+        bear0 = _bearing(lat0, lng0, waypoints[1][0], waypoints[1][1])
+        samples.insert(0, {
+            "lat":            round(lat0, 7),
+            "lng":            round(lng0, 7),
+            "travel_bearing": round(bear0, 1),
+            "head_left":      round((bear0 - 90) % 360, 1),
+            "head_right":     round((bear0 + 90) % 360, 1),
+        })
+
+    return samples
+
+
 # --- Street View corridor (ML-guided) ---
+
+def _expand_hot_zone_coverage(nodes, graph, corridor_pts, idw_fn,
+                               hot_thresh, corridor_thresh, spacing_m=22):
+    """Return extra viewpoints on hot-zone streets not covered by the main corridor.
+
+    Builds the hot subgraph (edges where both endpoints score >= hot_thresh),
+    finds which hot nodes are reachable from the current corridor, then samples
+    every uncovered hot edge (midpoint > 15 m from any existing corridor point).
+
+    Returns a list of corridor-point dicts (same schema as build_sv_corridor).
+    """
+    if not nodes or not graph:
+        return []
+
+    # Score every graph node via IDW
+    node_scores = {nid: idw_fn(lat, lng) for nid, (lat, lng) in nodes.items()}
+    hot_nodes = {nid for nid, s in node_scores.items() if s >= hot_thresh}
+    if not hot_nodes:
+        return []
+
+    # Hot subgraph: only edges where both endpoints are hot
+    hot_graph = {}
+    for nid in hot_nodes:
+        nbrs = [(nbr, d) for nbr, d in graph.get(nid, []) if nbr in hot_nodes]
+        if nbrs:
+            hot_graph[nid] = nbrs
+
+    # Nodes already "covered" by the current corridor (within 15 m)
+    covered = {
+        nid for nid, (nlat, nlng) in nodes.items()
+        if any(haversine(nlat, nlng, p["lat"], p["lng"]) < 15 for p in corridor_pts)
+    }
+
+    # Seed BFS from hot nodes that touch the current corridor
+    seed = hot_nodes & covered
+    if not seed:
+        # Relax to 50 m if no hot node is directly on the corridor
+        seed = {
+            nid for nid in hot_nodes
+            if any(haversine(nodes[nid][0], nodes[nid][1],
+                             p["lat"], p["lng"]) < 50 for p in corridor_pts)
+        }
+    if not seed:
+        return []
+
+    # BFS through hot subgraph to find all reachable hot nodes
+    reachable = set(seed)
+    queue = list(seed)
+    while queue:
+        cur = queue.pop(0)
+        for nbr, _ in hot_graph.get(cur, []):
+            if nbr not in reachable:
+                reachable.add(nbr)
+                queue.append(nbr)
+
+    # Sample every reachable hot edge not already covered by the corridor
+    extra_pts = []
+    seen_edges = set()
+    for cur_id in reachable:
+        cur_lat, cur_lng = nodes[cur_id]
+        for nbr_id, _ in hot_graph.get(cur_id, []):
+            if nbr_id not in reachable:
+                continue
+            edge_key = frozenset([cur_id, nbr_id])
+            if edge_key in seen_edges:
+                continue
+            seen_edges.add(edge_key)
+
+            nbr_lat, nbr_lng = nodes[nbr_id]
+            mid_lat = (cur_lat + nbr_lat) / 2
+            mid_lng = (cur_lng + nbr_lng) / 2
+            if any(haversine(mid_lat, mid_lng, p["lat"], p["lng"]) < 15
+                   for p in corridor_pts):
+                continue  # already covered
+
+            for pt in _sample_path([(cur_lat, cur_lng), (nbr_lat, nbr_lng)], spacing_m):
+                score = idw_fn(pt["lat"], pt["lng"])
+                if score >= corridor_thresh:
+                    extra_pts.append({
+                        "lat":            pt["lat"],
+                        "lng":            pt["lng"],
+                        "idw_score":      round(score, 4),
+                        "head_left":      pt["head_left"],
+                        "head_right":     pt["head_right"],
+                        "travel_bearing": pt["travel_bearing"],
+                        "is_anchor":      False,
+                    })
+
+    return extra_pts
+
+
+def _build_screening_sv_calls(corridor_pts, stride=3):
+    """Sparse alternating L/R subset of corridor points for a cheap screening pass.
+
+    Takes every stride-th corridor point, alternating which side (left/right) so
+    both sides of the street are sampled across the route without doubling every call.
+    stride=3 on 79 pts → ~27 calls (vs 158 for full L+R).
+    """
+    calls = []
+    for i, pt in enumerate(corridor_pts):
+        if i % stride != 0:
+            continue
+        side    = "left" if (i // stride) % 2 == 0 else "right"
+        heading = pt["head_left"] if side == "left" else pt["head_right"]
+        calls.append({
+            "lat":          pt["lat"],
+            "lng":          pt["lng"],
+            "heading":      heading,
+            "pitch":        5,
+            "fov":          90,
+            "idw_score":    pt["idw_score"],
+            "side":         side,
+            "is_anchor":    pt.get("is_anchor", False),
+            "viewpoint_idx": i,
+        })
+    return calls
+
+
+def _add_junction_lookaround(corridor_pts, nodes, graph, snap_radius_m=15):
+    """Add SV calls for street-graph junction branches not covered by left/right.
+
+    For each corridor point within snap_radius_m of a junction node (degree >= 3),
+    checks every connected branch bearing.  Branches within ±45° of the existing
+    left or right heading (fov=90 each) are already covered; all others get an
+    extra call with side='junction'.
+
+    Mutates corridor_pts in-place: adds is_junction=True and junction_branches.
+    Returns list of extra sv_call dicts.
+    """
+    if not nodes or not graph:
+        return []
+    junction_nodes = {nid for nid, nbrs in graph.items() if len(nbrs) >= 3}
+    if not junction_nodes:
+        return []
+
+    extra_calls = []
+    for pt in corridor_pts:
+        best_jnid, best_dist = None, float("inf")
+        for jnid in junction_nodes:
+            jlat, jlng = nodes[jnid]
+            d = haversine(pt["lat"], pt["lng"], jlat, jlng)
+            if d < best_dist:
+                best_dist, best_jnid = d, jnid
+
+        if best_dist > snap_radius_m:
+            continue
+
+        jlat, jlng    = nodes[best_jnid]
+        travel_bear   = pt["travel_bearing"]
+        hl = (travel_bear - 90) % 360
+        hr = (travel_bear + 90) % 360
+
+        branch_bearings = [
+            round(_bearing(jlat, jlng, nodes[nbr][0], nodes[nbr][1]), 1)
+            for nbr, _ in graph[best_jnid]
+        ]
+        pt["is_junction"]      = True
+        pt["junction_branches"] = branch_bearings
+
+        for bear in branch_bearings:
+            diff_l = abs((bear - hl + 180) % 360 - 180)
+            diff_r = abs((bear - hr + 180) % 360 - 180)
+            if diff_l <= 45 or diff_r <= 45:
+                continue  # already well-covered
+            extra_calls.append({
+                "lat":          pt["lat"],
+                "lng":          pt["lng"],
+                "heading":      bear,
+                "pitch":        5,
+                "fov":          90,
+                "idw_score":    pt["idw_score"],
+                "side":         "junction",
+                "is_anchor":    pt.get("is_anchor", False),
+                "viewpoint_idx": pt.get("viewpoint_idx", 0),
+            })
+
+    n_junctions = sum(1 for p in corridor_pts if p.get("is_junction"))
+    if extra_calls:
+        print(f"  Junction look-around: {n_junctions} junction pts → "
+              f"+{len(extra_calls)} extra calls")
+    return extra_calls
+
+
+def _build_detail_sv_calls(corridor_pts, interesting_coords, nodes, graph, radius_m=35):
+    """Full L+R calls for corridor points within radius_m of any interesting coord.
+
+    Also appends junction look-around calls for those in-zone points.
+    interesting_coords is a list of (lat, lng) tuples flagged by the screening pass.
+    """
+    in_zone = [
+        pt for pt in corridor_pts
+        if any(haversine(pt["lat"], pt["lng"], lat, lng) < radius_m
+               for lat, lng in interesting_coords)
+    ]
+    calls = [
+        {
+            "lat":          pt["lat"],
+            "lng":          pt["lng"],
+            "heading":      h,
+            "pitch":        5,
+            "fov":          90,
+            "idw_score":    pt["idw_score"],
+            "side":         side,
+            "is_anchor":    pt.get("is_anchor", False),
+            "viewpoint_idx": pt.get("viewpoint_idx", 0),
+        }
+        for pt in in_zone
+        for side, h in [("left", pt["head_left"]), ("right", pt["head_right"])]
+    ]
+    if nodes and graph:
+        calls += _add_junction_lookaround(in_zone, nodes, graph)
+    print(f"  Detail pass: {len(in_zone)} in-zone pts → {len(calls)} calls "
+          f"({len(interesting_coords)} interesting coords, radius={radius_m}m)")
+    return calls
+
+
+def _build_detail_sv_calls_v2(corridor_pts, interesting_coords, nodes, graph,
+                               config=None):
+    """v2.0 Multi-angle detail capture for interesting corridor locations.
+
+    For each viewpoint near an interesting coord, captures:
+    - Standard L+R (fov=90) — existing perpendicular views
+    - Junction branches (fov=90) — branch directions at intersections
+    - Look-toward (fov=90) — adjacent VPs ±N looking TOWARD candidate
+    - Wide context (fov=120) — broader scene understanding
+    - Tight detail (fov=60) — close-up of wall/frontage
+
+    All calls include travel_bearing for fallback offset.
+    Returns list of SV call dicts.
+    """
+    cfg = config or SV_CONFIG
+    radius_m = cfg.get("clustering_radius_m", 35)
+    look_range = cfg.get("look_toward_range", 2)
+    fov_set = cfg.get("detail_fov_set", [60, 90, 120])
+
+    # Find in-zone viewpoints (near an interesting coord)
+    in_zone_idxs = set()
+    for i, pt in enumerate(corridor_pts):
+        for lat, lng in interesting_coords:
+            if haversine(pt["lat"], pt["lng"], lat, lng) < radius_m:
+                in_zone_idxs.add(i)
+                break
+    in_zone = [corridor_pts[i] for i in sorted(in_zone_idxs)]
+
+    calls = []
+
+    # Standard L+R (fov=90)
+    for pt in in_zone:
+        for side, h in [("left", pt["head_left"]), ("right", pt["head_right"])]:
+            calls.append({
+                "lat":           pt["lat"],
+                "lng":           pt["lng"],
+                "heading":       h,
+                "pitch":         5,
+                "fov":           90,
+                "idw_score":     pt["idw_score"],
+                "side":          side,
+                "is_anchor":     pt.get("is_anchor", False),
+                "viewpoint_idx": pt.get("viewpoint_idx", 0),
+                "travel_bearing": pt.get("travel_bearing", 0),
+                "capture_type":  "standard",
+            })
+
+    # Wide context (fov=120) — L+R at wider FOV
+    if 120 in fov_set:
+        for pt in in_zone:
+            for side, h in [("left", pt["head_left"]), ("right", pt["head_right"])]:
+                calls.append({
+                    "lat":           pt["lat"],
+                    "lng":           pt["lng"],
+                    "heading":       h,
+                    "pitch":         5,
+                    "fov":           120,
+                    "idw_score":     pt["idw_score"],
+                    "side":          f"wide_{side}",
+                    "is_anchor":     pt.get("is_anchor", False),
+                    "viewpoint_idx": pt.get("viewpoint_idx", 0),
+                    "travel_bearing": pt.get("travel_bearing", 0),
+                    "capture_type":  "wide",
+                })
+
+    # Tight detail (fov=60) — best-side only (or both if no best_side known yet)
+    if 60 in fov_set:
+        for pt in in_zone:
+            for side, h in [("left", pt["head_left"]), ("right", pt["head_right"])]:
+                calls.append({
+                    "lat":           pt["lat"],
+                    "lng":           pt["lng"],
+                    "heading":       h,
+                    "pitch":         5,
+                    "fov":           60,
+                    "idw_score":     pt["idw_score"],
+                    "side":          f"tight_{side}",
+                    "is_anchor":     pt.get("is_anchor", False),
+                    "viewpoint_idx": pt.get("viewpoint_idx", 0),
+                    "travel_bearing": pt.get("travel_bearing", 0),
+                    "capture_type":  "tight",
+                })
+
+    # Look-toward: adjacent viewpoints looking TOWARD the interesting coord
+    # For each interesting coord, find the ±N closest corridor points and
+    # compute a heading from that adjacent VP toward the interesting coord
+    corridor_idx_map = {pt.get("viewpoint_idx", i): i
+                        for i, pt in enumerate(corridor_pts)}
+    for int_lat, int_lng in interesting_coords:
+        # Find the closest corridor point to this interesting coord
+        closest_idx = min(range(len(corridor_pts)),
+                          key=lambda i: haversine(corridor_pts[i]["lat"],
+                                                   corridor_pts[i]["lng"],
+                                                   int_lat, int_lng))
+        # Look at adjacent viewpoints
+        for delta in range(-look_range, look_range + 1):
+            adj_idx = closest_idx + delta
+            if delta == 0 or adj_idx < 0 or adj_idx >= len(corridor_pts):
+                continue
+            adj_pt = corridor_pts[adj_idx]
+            # Only if this adjacent point is not already in the zone
+            # (to avoid duplicates with standard L/R)
+            if adj_idx in in_zone_idxs:
+                continue
+            # Heading from adjacent VP toward the interesting coord
+            toward_heading = _bearing(adj_pt["lat"], adj_pt["lng"], int_lat, int_lng)
+            calls.append({
+                "lat":           adj_pt["lat"],
+                "lng":           adj_pt["lng"],
+                "heading":       round(toward_heading, 1),
+                "pitch":         5,
+                "fov":           90,
+                "idw_score":     adj_pt.get("idw_score", 0),
+                "side":          f"look_toward_{adj_pt.get('viewpoint_idx', adj_idx)}",
+                "is_anchor":     adj_pt.get("is_anchor", False),
+                "viewpoint_idx": adj_pt.get("viewpoint_idx", adj_idx),
+                "travel_bearing": adj_pt.get("travel_bearing", 0),
+                "capture_type":  "look_toward",
+                "target_coord":  (int_lat, int_lng),
+            })
+
+    # Junction look-around (existing function)
+    if nodes and graph:
+        junction_calls = _add_junction_lookaround(in_zone, nodes, graph)
+        for jc in junction_calls:
+            jc["travel_bearing"] = jc.get("travel_bearing", 0)
+            jc["capture_type"] = "junction"
+        calls += junction_calls
+
+    # Deduplicate: same (viewpoint_idx, side) only once
+    seen = set()
+    deduped = []
+    for c in calls:
+        key = (c["viewpoint_idx"], c["side"])
+        if key not in seen:
+            seen.add(key)
+            deduped.append(c)
+
+    print(f"  Detail v2: {len(in_zone)} in-zone pts → {len(deduped)} calls "
+          f"({len(interesting_coords)} interesting coords, radius={radius_m}m)")
+    by_type = {}
+    for c in deduped:
+        t = c.get("capture_type", "unknown")
+        by_type[t] = by_type.get(t, 0) + 1
+    print(f"    Breakdown: {by_type}")
+    return deduped
+
 
 def build_sv_corridor(sector_code, hot_thresh=0.60, corridor_thresh=0.45, spacing_m=22):
     """Build a Street View API corridor through the ML hot zone of a sector.
@@ -1505,13 +2101,6 @@ def build_sv_corridor(sector_code, hot_thresh=0.60, corridor_thresh=0.45, spacin
         w  = 1.0 / (d2 + 1e-12) ** power
         return float((w * sec["score"]).sum() / w.sum())
 
-    def _bearing(lat1, lng1, lat2, lng2):
-        dL = (lng2 - lng1) * DEG_TO_RAD
-        x  = math.cos(lat2 * DEG_TO_RAD) * math.sin(dL)
-        y  = (math.cos(lat1 * DEG_TO_RAD) * math.sin(lat2 * DEG_TO_RAD)
-              - math.sin(lat1 * DEG_TO_RAD) * math.cos(lat2 * DEG_TO_RAD) * math.cos(dL))
-        return (math.atan2(x, y) / DEG_TO_RAD) % 360
-
     hot = sec[sec["score"] >= hot_thresh].copy()
     if len(hot) < 2:
         print(f"  build_sv_corridor: <2 anchors at score >= {hot_thresh}, skipping")
@@ -1525,31 +2114,91 @@ def build_sv_corridor(sector_code, hot_thresh=0.60, corridor_thresh=0.45, spacin
                 for i in range(len(pts) - 1)]
         return sum(mids) / len(mids)
 
-    best_order, best_score = max(
-        ((p, _score_order(p)) for p in itertools.permutations(range(len(hot)))),
-        key=lambda x: x[1])
+    n_hot = len(hot)
+    if n_hot <= 8:
+        # Brute force for small sets (8! = 40320)
+        best_order, best_score = max(
+            ((p, _score_order(p)) for p in itertools.permutations(range(n_hot))),
+            key=lambda x: x[1])
+    else:
+        # Greedy nearest-neighbor + 2-opt for large sets
+        print(f"  build_sv_corridor: {n_hot} hot cells, using greedy+2-opt ordering")
+        coords = [(float(hot.iloc[i]["lat"]), float(hot.iloc[i]["lng"])) for i in range(n_hot)]
+        visited = [False] * n_hot
+        order = [0]
+        visited[0] = True
+        for _ in range(n_hot - 1):
+            last = order[-1]
+            best_next, best_d = -1, float("inf")
+            for j in range(n_hot):
+                if not visited[j]:
+                    d = haversine(coords[last][0], coords[last][1],
+                                  coords[j][0], coords[j][1])
+                    if d < best_d:
+                        best_d, best_next = d, j
+            visited[best_next] = True
+            order.append(best_next)
+        # 2-opt improvement (max 5 passes to bound runtime)
+        cur_score = _score_order(tuple(order))
+        for _pass in range(5):
+            improved = False
+            for i in range(1, n_hot - 1):
+                for j in range(i + 1, n_hot):
+                    new_order = order[:i] + order[i:j+1][::-1] + order[j+1:]
+                    new_score = _score_order(tuple(new_order))
+                    if new_score > cur_score:
+                        order = new_order
+                        cur_score = new_score
+                        improved = True
+            if not improved:
+                break
+        best_order = tuple(order)
+        best_score = cur_score
     anchors = [hot.iloc[i] for i in best_order]
 
-    # Interpolate sample points
+    # Fetch street graph for anchor bbox + 50m margin
+    all_lats = [float(a["lat"]) for a in anchors]
+    all_lngs = [float(a["lng"]) for a in anchors]
+    mid_lat  = sum(all_lats) / len(all_lats)
+    lat_m    = 1 / 111_000
+    lng_m    = 1 / (111_000 * math.cos(mid_lat * DEG_TO_RAD))
+    margin   = 50
+    graph_nodes, graph_edges = _fetch_street_graph(
+        min(all_lats) - margin * lat_m,
+        max(all_lats) + margin * lat_m,
+        min(all_lngs) - margin * lng_m,
+        max(all_lngs) + margin * lng_m,
+    )
+    use_street_graph = bool(graph_nodes)
+
+    # Route each anchor-to-anchor segment on the street graph
     all_pts = []
     for i in range(len(anchors) - 1):
-        a, b   = anchors[i], anchors[i + 1]
+        a, b       = anchors[i], anchors[i + 1]
         alat, alng = float(a["lat"]), float(a["lng"])
         blat, blng = float(b["lat"]), float(b["lng"])
-        total_m    = haversine(alat, alng, blat, blng)
-        n_steps    = max(1, int(total_m / spacing_m))
-        bear = _bearing(alat, alng, blat, blng)
-        hl   = (bear - 90) % 360
-        hr   = (bear + 90) % 360
-        for j in range(n_steps + 1):
-            t   = j / n_steps
-            lat = alat + t * (blat - alat)
-            lng = alng + t * (blng - alng)
+
+        routed = None
+        if use_street_graph:
+            routed = _route_on_graph(graph_nodes, graph_edges, alat, alng, blat, blng)
+
+        if routed is None:
+            # Fallback: straight-line synthetic waypoints
+            total_m = haversine(alat, alng, blat, blng)
+            n_steps = max(1, int(total_m / spacing_m))
+            routed  = [(alat + t / n_steps * (blat - alat),
+                        alng + t / n_steps * (blng - alng))
+                       for t in range(n_steps + 1)]
+
+        for pt in _sample_path(routed, spacing_m):
             all_pts.append({
-                "lat": round(lat, 7), "lng": round(lng, 7),
-                "idw_score": round(_idw(lat, lng), 4),
-                "head_left": round(hl, 1), "head_right": round(hr, 1),
-                "travel_bearing": round(bear, 1), "is_anchor": False,
+                "lat":            pt["lat"],
+                "lng":            pt["lng"],
+                "idw_score":      round(_idw(pt["lat"], pt["lng"]), 4),
+                "head_left":      pt["head_left"],
+                "head_right":     pt["head_right"],
+                "travel_bearing": pt["travel_bearing"],
+                "is_anchor":      False,
             })
 
     # Deduplicate (< 5 m apart)
@@ -1568,22 +2217,46 @@ def build_sv_corridor(sector_code, hot_thresh=0.60, corridor_thresh=0.45, spacin
                 p["anchor_score"] = round(float(a["score"]), 4)
                 break
 
+    # Expand coverage to all reachable hot-zone street edges
+    n_extra = 0
+    if use_street_graph and deduped:
+        extra = _expand_hot_zone_coverage(
+            graph_nodes, graph_edges, deduped, _idw,
+            hot_thresh, corridor_thresh, spacing_m,
+        )
+        n_extra = len(extra)
+        for p in extra:
+            if not any(haversine(p["lat"], p["lng"], q["lat"], q["lng"]) < 5
+                       for q in deduped):
+                deduped.append(p)
+        if n_extra:
+            print(f"  Hot-zone expansion: +{n_extra} extra viewpoints on uncovered hot streets")
+
     # Filter to hot corridor
     corridor = [p for p in deduped if p["idw_score"] >= corridor_thresh]
     if not corridor:
         print(f"  build_sv_corridor: no points above corridor_thresh {corridor_thresh}, skipping")
         return None
 
+    # Tag each corridor point with its index (used by screening/detail pass helpers)
+    for i, pt in enumerate(corridor):
+        pt["viewpoint_idx"] = i
+
     sv_calls = [
         {"lat": p["lat"], "lng": p["lng"], "heading": h,
          "pitch": 5, "fov": 90, "idw_score": p["idw_score"],
-         "side": side, "is_anchor": p.get("is_anchor", False)}
-        for p in corridor
+         "side": side, "is_anchor": p.get("is_anchor", False),
+         "viewpoint_idx": i}
+        for i, p in enumerate(corridor)
         for side, h in [("left", p["head_left"]), ("right", p["head_right"])]
     ]
 
+    routing_mode = "street-graph+hot-expansion" if (use_street_graph and n_extra) else (
+        "street-graph" if use_street_graph else "straight-line"
+    )
     print(f"  SV corridor: {len(anchors)} anchors → {len(corridor)} viewpoints "
-          f"→ {len(sv_calls)} calls (corridor avg IDW={best_score:.3f})")
+          f"→ {len(sv_calls)} calls (corridor avg IDW={best_score:.3f}, "
+          f"routing={routing_mode})")
 
     return {
         "meta": {
@@ -1595,6 +2268,8 @@ def build_sv_corridor(sector_code, hot_thresh=0.60, corridor_thresh=0.45, spacin
             "n_viewpoints": len(corridor),
             "n_sv_calls": len(sv_calls),
             "corridor_avg_idw": round(best_score, 4),
+            "routing_mode": routing_mode,
+            "n_hot_expansion_pts": n_extra,
         },
         "anchor_order": [
             {"lat": float(a["lat"]), "lng": float(a["lng"]), "score": float(a["score"])}
@@ -1602,14 +2277,203 @@ def build_sv_corridor(sector_code, hot_thresh=0.60, corridor_thresh=0.45, spacin
         ],
         "corridor_points": corridor,
         "sv_calls": sv_calls,
+        # Internal: graph passed to two-pass analysis helpers; not JSON-serialised
+        "_graph_nodes": graph_nodes,
+        "_graph_edges": graph_edges,
     }
 
 
-def download_sv_corridor_images(sv_calls, img_dir):
+# --- SV v2.0: Smart download with metadata & fallback ---
+
+def _fetch_sv_metadata(lat, lng, api_key):
+    """Fetch Street View metadata for a location.
+
+    Returns dict with pano_id, actual coords, distance from requested location,
+    or None if no coverage.
+    """
+    meta_url = (f"https://maps.googleapis.com/maps/api/streetview/metadata?"
+                f"location={lat},{lng}&key={api_key}")
+    try:
+        req = urllib.request.Request(meta_url, headers=HEADERS)
+        meta = json.loads(urllib.request.urlopen(req, timeout=10).read().decode())
+        if meta.get("status") != "OK":
+            return None
+        loc = meta.get("location", {})
+        actual_lat = loc.get("lat", lat)
+        actual_lng = loc.get("lng", lng)
+        dist = haversine(lat, lng, actual_lat, actual_lng)
+        return {
+            "pano_id": meta.get("pano_id"),
+            "lat": actual_lat,
+            "lng": actual_lng,
+            "dist_from_requested": round(dist, 1),
+            "date": meta.get("date", ""),
+            "status": "OK",
+        }
+    except Exception:
+        return None
+
+
+def _validate_sv_image(img_path):
+    """Check if a downloaded SV image is valid (not a gray placeholder).
+
+    Google returns a tiny gray image when no imagery is available.
+    Returns False for placeholder/invalid images.
+    """
+    try:
+        size = img_path.stat().st_size
+        if size < 5000:  # Gray placeholders are typically < 5KB
+            return False
+        return True
+    except Exception:
+        return False
+
+
+def _offset_point(lat, lng, bearing_deg, distance_m):
+    """Move a point along a bearing by distance_m metres. Returns (new_lat, new_lng)."""
+    d = distance_m / R_EARTH
+    brng = bearing_deg * DEG_TO_RAD
+    lat1 = lat * DEG_TO_RAD
+    lng1 = lng * DEG_TO_RAD
+    lat2 = math.asin(math.sin(lat1) * math.cos(d) +
+                      math.cos(lat1) * math.sin(d) * math.cos(brng))
+    lng2 = lng1 + math.atan2(math.sin(brng) * math.sin(d) * math.cos(lat1),
+                              math.cos(d) - math.sin(lat1) * math.sin(lat2))
+    return round(math.degrees(lat2), 7), round(math.degrees(lng2), 7)
+
+
+def _download_sv_image(lat, lng, heading, pitch, fov, api_key, img_path):
+    """Download a single SV image. Returns True if valid image saved."""
+    source = "&source=outdoor" if SV_CONFIG.get("source_outdoor", True) else ""
+    sv_url = (f"https://maps.googleapis.com/maps/api/streetview?"
+              f"size=800x600&location={lat},{lng}"
+              f"&heading={heading}&pitch={pitch}&fov={fov}{source}&key={api_key}")
+    try:
+        req = urllib.request.Request(sv_url, headers=HEADERS)
+        resp = urllib.request.urlopen(req, timeout=15)
+        data = resp.read()
+        with open(img_path, "wb") as fh:
+            fh.write(data)
+        return _validate_sv_image(img_path)
+    except Exception:
+        return False
+
+
+def _download_sv_with_pano(pano_id, heading, pitch, fov, api_key, img_path):
+    """Download SV image using a specific pano_id. Returns True if valid."""
+    source = "&source=outdoor" if SV_CONFIG.get("source_outdoor", True) else ""
+    sv_url = (f"https://maps.googleapis.com/maps/api/streetview?"
+              f"size=800x600&pano={pano_id}"
+              f"&heading={heading}&pitch={pitch}&fov={fov}{source}&key={api_key}")
+    try:
+        req = urllib.request.Request(sv_url, headers=HEADERS)
+        resp = urllib.request.urlopen(req, timeout=15)
+        data = resp.read()
+        with open(img_path, "wb") as fh:
+            fh.write(data)
+        return _validate_sv_image(img_path)
+    except Exception:
+        return False
+
+
+def _classify_image_heuristic(img_path):
+    """Cheap PIL heuristic to detect likely indoor images.
+
+    Interior photos typically have dark upper bands (ceilings instead of sky)
+    and lower overall brightness variance.
+
+    Returns dict with sky_brightness (0-255) and likely_indoor (bool).
+    """
+    try:
+        from PIL import Image
+        img = Image.open(img_path).convert("L")  # grayscale
+        w, h = img.size
+        # Top 15% of image = sky/ceiling band
+        sky_band = img.crop((0, 0, w, int(h * 0.15)))
+        sky_pixels = list(sky_band.getdata())
+        sky_brightness = sum(sky_pixels) / len(sky_pixels) if sky_pixels else 128
+        # Full image brightness for variance check
+        all_pixels = list(img.getdata())
+        avg = sum(all_pixels) / len(all_pixels)
+        variance = sum((p - avg) ** 2 for p in all_pixels) / len(all_pixels)
+        # Indoor: dark ceiling (sky_brightness < 80) or very low variance
+        likely_indoor = sky_brightness < 80 or (sky_brightness < 110 and variance < 1500)
+        return {
+            "sky_brightness": round(sky_brightness, 1),
+            "brightness_variance": round(variance, 1),
+            "likely_indoor": likely_indoor,
+        }
+    except Exception:
+        return {"sky_brightness": 128, "brightness_variance": 3000, "likely_indoor": False}
+
+
+def _download_sv_with_fallback(call, api_key, img_path, config=None):
+    """Smart SV download with fallback strategies.
+
+    Strategy chain (stop on first valid image):
+    1. Primary: exact coords + heading
+    2. Offset: ±offset_m along travel direction
+    3. Rotated heading: ±heading_delta from original
+    4. Use nearby pano_id from metadata (if within max_dist)
+
+    Records which strategy worked on the call dict under 'download_strategy'.
+    Returns True if a valid image was saved, False otherwise.
+    """
+    cfg = config or SV_CONFIG
+    lat, lng = call["lat"], call["lng"]
+    heading = call["heading"]
+    pitch = call.get("pitch", 5)
+    fov = call.get("fov", 90)
+    travel_bearing = call.get("travel_bearing", heading)
+
+    # Strategy 1: Primary — exact coords + heading
+    if _download_sv_image(lat, lng, heading, pitch, fov, api_key, img_path):
+        call["download_strategy"] = "primary"
+        return True
+
+    # Strategy 2: Offset along travel direction
+    offset_m = cfg.get("fallback_offset_m", 5)
+    for direction in [0, 180]:  # forward and backward
+        off_bearing = (travel_bearing + direction) % 360
+        off_lat, off_lng = _offset_point(lat, lng, off_bearing, offset_m)
+        meta = _fetch_sv_metadata(off_lat, off_lng, api_key)
+        if meta and meta["dist_from_requested"] < cfg.get("fallback_pano_max_dist_m", 40):
+            if _download_sv_image(off_lat, off_lng, heading, pitch, fov, api_key, img_path):
+                call["download_strategy"] = f"offset_{'+' if direction == 0 else '-'}{offset_m}m"
+                time.sleep(0.1)
+                return True
+        time.sleep(0.1)
+
+    # Strategy 3: Rotated heading
+    delta = cfg.get("fallback_heading_delta", 20)
+    for rot in [delta, -delta]:
+        new_heading = (heading + rot) % 360
+        if _download_sv_image(lat, lng, new_heading, pitch, fov, api_key, img_path):
+            call["download_strategy"] = f"rotated_{'+' if rot > 0 else ''}{rot}deg"
+            return True
+
+    # Strategy 4: Use nearby pano_id
+    meta = _fetch_sv_metadata(lat, lng, api_key)
+    if meta and meta.get("pano_id"):
+        max_dist = cfg.get("fallback_pano_max_dist_m", 40)
+        if meta["dist_from_requested"] <= max_dist:
+            if _download_sv_with_pano(meta["pano_id"], heading, pitch, fov, api_key, img_path):
+                call["download_strategy"] = f"pano_{meta['pano_id'][:8]}_dist{meta['dist_from_requested']}m"
+                return True
+
+    call["download_strategy"] = "failed"
+    return False
+
+
+def download_sv_corridor_images(sv_calls, img_dir, prefix="", use_fallback=True):
     """Download Street View images for every call in the ML corridor.
 
-    Images are saved as sv_corridor_{n}_left.png / sv_corridor_{n}_right.png.
+    Images are saved as {prefix}sv_{viewpoint_idx}_{side}.png.
+    Add prefix="screen_" or "detail_" to keep passes separate.
     Skips quietly if no Google Maps API key is configured.
+
+    v2.0: With use_fallback=True, uses smart fallback strategies for
+    blocked/unavailable views.
     """
     try:
         from dotenv import load_dotenv
@@ -1622,46 +2486,979 @@ def download_sv_corridor_images(sv_calls, img_dir):
         print("  download_sv_corridor_images: no GOOGLE_MAPS_API_KEY, skipping")
         return
 
-    print(f"  Downloading {len(sv_calls)} corridor Street View images...")
-    counters = {}   # (lat, lng) → per-position index for filename
+    print(f"  Downloading {len(sv_calls)} corridor Street View images (prefix='{prefix}')...")
     saved = 0
+    skipped = 0
+    fallback_used = 0
 
     for call in sv_calls:
-        lat, lng    = call["lat"], call["lng"]
-        heading     = call["heading"]
-        side        = call["side"]
-        pos_key     = (lat, lng)
-        counters[pos_key] = counters.get(pos_key, 0) + 1
-        n           = counters[pos_key]
+        lat, lng = call["lat"], call["lng"]
+        side     = call["side"]
+        vidx     = call.get("viewpoint_idx", 0)
+        fname    = img_dir / f"{prefix}sv_{vidx}_{side}.png"
 
-        # Check availability
-        meta_url = (f"https://maps.googleapis.com/maps/api/streetview/metadata?"
-                    f"location={lat},{lng}&key={api_key}")
-        try:
-            req  = urllib.request.Request(meta_url, headers=HEADERS)
-            meta = json.loads(urllib.request.urlopen(req, timeout=10).read().decode())
-            if meta.get("status") != "OK":
+        if fname.exists() and _validate_sv_image(fname):
+            saved += 1
+            skipped += 1
+            call["download_strategy"] = "cached"
+            call["heuristic"] = _classify_image_heuristic(fname)
+            continue  # already downloaded (e.g. on re-run)
+
+        if use_fallback:
+            if _download_sv_with_fallback(call, api_key, fname):
+                saved += 1
+                call["heuristic"] = _classify_image_heuristic(fname)
+                strategy = call.get("download_strategy", "unknown")
+                if strategy != "primary":
+                    fallback_used += 1
+            # rate limit
+            time.sleep(0.15)
+        else:
+            # Legacy direct download (no fallback)
+            meta_url = (f"https://maps.googleapis.com/maps/api/streetview/metadata?"
+                        f"location={lat},{lng}&key={api_key}")
+            try:
+                req  = urllib.request.Request(meta_url, headers=HEADERS)
+                meta = json.loads(urllib.request.urlopen(req, timeout=10).read().decode())
+                if meta.get("status") != "OK":
+                    continue
+            except Exception:
                 continue
-        except Exception:
+
+            heading = call["heading"]
+            source = "&source=outdoor" if SV_CONFIG.get("source_outdoor", True) else ""
+            sv_url = (f"https://maps.googleapis.com/maps/api/streetview?"
+                      f"size=800x600&location={lat},{lng}"
+                      f"&heading={heading}&pitch={call.get('pitch', 5)}"
+                      f"&fov={call.get('fov', 90)}{source}&key={api_key}")
+            try:
+                req2  = urllib.request.Request(sv_url, headers=HEADERS)
+                resp2 = urllib.request.urlopen(req2, timeout=15)
+                with open(fname, "wb") as fh:
+                    fh.write(resp2.read())
+                saved += 1
+                call["heuristic"] = _classify_image_heuristic(fname)
+            except Exception as e:
+                print(f"    corridor SV {prefix}{vidx}_{side}: download failed: {e}")
+
+            time.sleep(0.15)
+
+    stats = f"  Corridor images saved: {saved}/{len(sv_calls)}"
+    if skipped:
+        stats += f" ({skipped} cached)"
+    if fallback_used:
+        stats += f" ({fallback_used} via fallback)"
+    print(stats)
+
+
+def analyze_sv_corridor_images(sv_calls, img_dir, prefix="", model="claude-sonnet-4-6",
+                                output_path=None, interesting_threshold=6):
+    """Analyse downloaded corridor SV images with Claude vision.
+
+    Groups images by viewpoint_idx, sends each group to Claude with the
+    locker placement prompt, and writes a JSON results file.
+
+    Screening pass (sonnet): identify interesting coords for detail pass.
+    Detail pass (opus):      final placement assessment with markup coordinates.
+
+    Returns a dict with keys: meta, viewpoints, interesting_coords, top_candidates.
+    Returns None if ANTHROPIC_API_KEY is not set.
+    """
+    try:
+        from dotenv import load_dotenv
+        load_dotenv(Path(__file__).resolve().parent.parent / ".env", override=True)
+    except ImportError:
+        pass
+
+    api_key = os.getenv("ANTHROPIC_API_KEY")
+    if not api_key:
+        print("  analyze_sv_corridor_images: no ANTHROPIC_API_KEY, skipping")
+        return None
+
+    import base64
+    from datetime import datetime
+
+    img_dir = Path(img_dir)
+
+    # Build index: viewpoint_idx → {lat, lng, idw_score, images: [path, ...]}
+    vp_index = {}
+    for call in sv_calls:
+        vidx = call.get("viewpoint_idx", 0)
+        if vidx not in vp_index:
+            vp_index[vidx] = {
+                "viewpoint_idx": vidx,
+                "lat":           call["lat"],
+                "lng":           call["lng"],
+                "idw_score":     call["idw_score"],
+                "is_anchor":     call.get("is_anchor", False),
+                "is_junction":   call.get("is_junction", False),
+                "images":        [],
+            }
+        img_path = img_dir / f"{prefix}sv_{vidx}_{call['side']}.png"
+        if img_path.exists():
+            vp_index[vidx]["images"].append(str(img_path))
+
+    # Remove viewpoints with no downloaded images
+    vp_index = {k: v for k, v in vp_index.items() if v["images"]}
+    print(f"  analyze_sv_corridor_images: {len(vp_index)} viewpoints with images "
+          f"(pass prefix='{prefix}', model={model})")
+
+    locker_prompt = (
+        "You are assessing a street location for a bpost bbox parcel locker installation.\n\n"
+        "Available locker sizes:\n"
+        "  Compact:  0.6m wide × 0.7m deep × 2.0m tall  (needs 1.2m clear passage)\n"
+        "  Standard: 1.2m wide × 0.7m deep × 2.0m tall  (needs 1.5m clear passage)\n"
+        "  Large:    2.4m wide × 0.7m deep × 2.0m tall  (needs 1.5m clear passage)\n"
+        "  XL:       4.8m+ wide × 0.7m deep × 2.0m tall (needs 2.0m clear passage)\n\n"
+        "Requirements for ANY size: level paved ground, unobstructed wall/frontage,\n"
+        "no blocking of exits, wheelchair access, or shop entrances.\n\n"
+        "Images show {sides} of the street at this location. "
+        "Respond ONLY with valid JSON (no markdown fences):\n"
+        '{{\n'
+        '  "largest_viable_size": "compact"|"standard"|"large"|"xl"|"none",\n'
+        '  "placement_score": 0-10,\n'
+        '  "best_side": "left"|"right"|"junction"|"none",\n'
+        '  "placement_x_pct": 0-100,\n'
+        '  "available_width_m": 1.5,\n'
+        '  "footpath_width_estimate": "e.g. ~2.5m, adequate for standard",\n'
+        '  "obstacles": ["list"],\n'
+        '  "wall_available": true|false,\n'
+        '  "surface": "paved"|"cobblestone"|"unpaved"|"unclear",\n'
+        '  "notes": "one sentence on key factor"\n'
+        '}}\n'
+        'placement_x_pct: horizontal center of locker as % of image width (0=left, 100=right).\n'
+        'available_width_m: estimated clear wall space in metres.'
+    )
+
+    results = []
+    for vidx in sorted(vp_index.keys()):
+        vp = vp_index[vidx]
+        sides_str = " and ".join(
+            Path(p).stem.split("_")[-1] for p in vp["images"]
+        )
+        prompt = locker_prompt.format(sides=sides_str)
+
+        content = []
+        for img_path in vp["images"]:
+            with open(img_path, "rb") as fh:
+                raw = fh.read()
+            b64 = base64.standard_b64encode(raw).decode()
+            # Auto-detect media type from file header (Google SV returns JPEG despite .png ext)
+            if raw[:3] == b'\xff\xd8\xff':
+                media_type = "image/jpeg"
+            elif raw[:8] == b'\x89PNG\r\n\x1a\n':
+                media_type = "image/png"
+            else:
+                media_type = "image/jpeg"  # safe default
+            content.append({
+                "type": "image",
+                "source": {"type": "base64", "media_type": media_type, "data": b64},
+            })
+        content.append({"type": "text", "text": prompt})
+
+        try:
+            req_body = json.dumps({
+                "model":      model,
+                "max_tokens": 512,
+                "messages":   [{"role": "user", "content": content}],
+            }).encode()
+            req = urllib.request.Request(
+                "https://api.anthropic.com/v1/messages",
+                data=req_body,
+                headers={
+                    "x-api-key":         api_key,
+                    "anthropic-version": "2023-06-01",
+                    "content-type":      "application/json",
+                },
+                method="POST",
+            )
+            resp = urllib.request.urlopen(req, timeout=30)
+            body = json.loads(resp.read().decode())
+            raw  = body["content"][0]["text"].strip()
+            # Strip any accidental markdown fences
+            if raw.startswith("```"):
+                raw = raw.split("```")[1]
+                if raw.startswith("json"):
+                    raw = raw[4:]
+            analysis = json.loads(raw)
+        except Exception as e:
+            print(f"    viewpoint {vidx}: analysis failed ({e})")
+            analysis = {"largest_viable_size": "none", "placement_score": 0,
+                        "notes": f"analysis error: {e}"}
+
+        results.append({**vp, "analysis": analysis})
+        time.sleep(0.3)
+
+    # Interesting coords = viewpoints scoring >= interesting_threshold
+    interesting_coords = [
+        (r["lat"], r["lng"])
+        for r in results
+        if r["analysis"].get("placement_score", 0) >= interesting_threshold
+        and r["analysis"].get("largest_viable_size", "none") != "none"
+    ]
+
+    # Top candidates sorted by placement_score
+    top_candidates = sorted(
+        [r for r in results if r["analysis"].get("placement_score", 0) >= interesting_threshold],
+        key=lambda x: x["analysis"].get("placement_score", 0),
+        reverse=True,
+    )[:10]
+
+    n_pass = sum(1 for r in results if r["analysis"].get("largest_viable_size", "none") != "none")
+    output_dict = {
+        "meta": {
+            "pass":         "screening" if "screen" in prefix else "detail",
+            "sector":       "unknown",
+            "model":        model,
+            "version":      SV_ANALYSIS_VERSION,
+            "n_analysed":   len(results),
+            "n_viable":     n_pass,
+            "at":           datetime.utcnow().isoformat(),
+        },
+        "viewpoints":        results,
+        "interesting_coords": interesting_coords,
+        "top_candidates":    top_candidates,
+    }
+
+    if output_path:
+        output_path = Path(output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+
+        class _SafeEnc(json.JSONEncoder):
+            def default(self, obj):
+                import numpy as np
+                if isinstance(obj, (np.integer,)):  return int(obj)
+                if isinstance(obj, (np.floating,)): return float(obj)
+                return super().default(obj)
+
+        with open(output_path, "w") as fh:
+            json.dump(output_dict, fh, indent=2, cls=_SafeEnc)
+        print(f"  Analysis saved → {output_path.name} "
+              f"({n_pass}/{len(results)} viable, {len(interesting_coords)} interesting)")
+
+    return output_dict
+
+
+def _cluster_candidates(sv_calls, interesting_coords, config=None):
+    """Cluster viewpoints by proximity to interesting coordinates.
+
+    Groups all SV calls that are within clustering_radius_m of the same
+    interesting coord into candidate groups. Returns list of groups, each
+    a dict with 'center' (lat, lng), 'calls' (list of call dicts).
+    """
+    cfg = config or SV_CONFIG
+    radius = cfg.get("clustering_radius_m", 35)
+
+    groups = []
+    for int_lat, int_lng in interesting_coords:
+        nearby = [c for c in sv_calls
+                  if haversine(c["lat"], c["lng"], int_lat, int_lng) < radius]
+        if nearby:
+            groups.append({
+                "center": (int_lat, int_lng),
+                "calls": nearby,
+            })
+
+    # Merge overlapping groups (share > 50% of calls)
+    merged = []
+    used = set()
+    for i, g1 in enumerate(groups):
+        if i in used:
+            continue
+        current = dict(g1)
+        call_set = set(id(c) for c in g1["calls"])
+        for j, g2 in enumerate(groups):
+            if j <= i or j in used:
+                continue
+            g2_set = set(id(c) for c in g2["calls"])
+            overlap = len(call_set & g2_set)
+            if overlap > 0.5 * min(len(call_set), len(g2_set)):
+                # Merge: use centroid of both centers
+                c1, c2 = current["center"], g2["center"]
+                current["center"] = (
+                    round((c1[0] + c2[0]) / 2, 7),
+                    round((c1[1] + c2[1]) / 2, 7),
+                )
+                # Union of calls (deduplicate by id)
+                existing_ids = {id(c) for c in current["calls"]}
+                for c in g2["calls"]:
+                    if id(c) not in existing_ids:
+                        current["calls"].append(c)
+                        existing_ids.add(id(c))
+                call_set = existing_ids
+                used.add(j)
+        merged.append(current)
+        used.add(i)
+
+    return merged
+
+
+def analyze_sv_corridor_grouped(sv_calls, img_dir, interesting_coords,
+                                 prefix="detail_", config=None,
+                                 output_path=None):
+    """v2.0 Grouped multi-angle Opus analysis.
+
+    Clusters viewpoints by proximity to interesting coords, sends ALL images
+    for each candidate group in a single Opus call. This gives Opus the full
+    context — multiple angles, converging views, wide + tight shots — for
+    a comprehensive placement assessment.
+
+    Returns dict with: meta, candidate_groups, top_candidates.
+    """
+    cfg = config or SV_CONFIG
+    max_images = cfg.get("max_images_per_candidate", 12)
+
+    try:
+        from dotenv import load_dotenv
+        load_dotenv(Path(__file__).resolve().parent.parent / ".env", override=True)
+    except ImportError:
+        pass
+
+    api_key = os.getenv("ANTHROPIC_API_KEY")
+    if not api_key:
+        print("  analyze_sv_corridor_grouped: no ANTHROPIC_API_KEY, skipping")
+        return None
+
+    import base64
+    from datetime import datetime
+
+    img_dir = Path(img_dir)
+
+    # Cluster candidates
+    groups = _cluster_candidates(sv_calls, interesting_coords, cfg)
+    print(f"  Grouped analysis: {len(groups)} candidate groups from "
+          f"{len(interesting_coords)} interesting coords")
+
+    # Build image inventory for each group
+    for group in groups:
+        images = []
+        seen_paths = set()
+        for call in group["calls"]:
+            vidx = call.get("viewpoint_idx", 0)
+            side = call["side"]
+            img_path = img_dir / f"{prefix}sv_{vidx}_{side}.png"
+            if img_path.exists() and str(img_path) not in seen_paths:
+                if _validate_sv_image(img_path):
+                    heuristic = call.get("heuristic") or _classify_image_heuristic(img_path)
+                    images.append({
+                        "path": str(img_path),
+                        "viewpoint_idx": vidx,
+                        "side": side,
+                        "capture_type": call.get("capture_type", "standard"),
+                        "fov": call.get("fov", 90),
+                        "heading": call.get("heading", 0),
+                        "heuristic_indoor": heuristic.get("likely_indoor", False),
+                    })
+                    seen_paths.add(str(img_path))
+        # Prioritize: standard > tight > wide > look_toward > junction
+        type_priority = {"standard": 0, "tight": 1, "wide": 2, "look_toward": 3, "junction": 4}
+        images.sort(key=lambda x: type_priority.get(x["capture_type"], 5))
+        group["images"] = images[:max_images]
+
+    # Prompt for grouped analysis
+    grouped_prompt = (
+        "You are assessing a street location for a bpost bbox parcel locker installation.\n\n"
+        "You are viewing MULTIPLE angles of the SAME candidate location — including:\n"
+        "- Standard left/right views (perpendicular to street, fov=90°)\n"
+        "- Wide context views (fov=120°) for broader scene understanding\n"
+        "- Tight detail views (fov=60°) for close-up of wall/frontage\n"
+        "- 'Look-toward' views from nearby positions converging on this spot\n"
+        "- Junction branch views where streets meet\n\n"
+        "Cross-reference all available angles to build a complete understanding of the space.\n"
+        "If a view is blocked by a vehicle or obstacle, check other angles to see behind it.\n\n"
+        "IMPORTANT — SCENE CLASSIFICATION:\n"
+        "Some images may show INTERIOR spaces (inside shops, malls, gyms, covered galleries)\n"
+        "or UNSUITABLE scenes (parks with no wall, construction sites, narrow alleys, parking lots).\n"
+        "You MUST classify the scene before assessing placement:\n"
+        "- scene_type: 'exterior' | 'interior' | 'covered' (covered = arcade, gallery, canopy)\n"
+        "- is_viable_exterior: false if scene is fundamentally unsuitable for outdoor locker placement\n"
+        "- interior_image_indices: list of 0-based image indices showing indoor/covered scenes\n"
+        "If ALL images are interior/covered → set placement_score=0 and is_viable_exterior=false.\n"
+        "Interior photos show store aisles, gym equipment, mall galleries, indoor ceilings, etc.\n\n"
+        "Available locker sizes:\n"
+        "  Compact:  0.6m wide × 0.7m deep × 2.0m tall  (needs 1.2m clear passage)\n"
+        "  Standard: 1.2m wide × 0.7m deep × 2.0m tall  (needs 1.5m clear passage)\n"
+        "  Large:    2.4m wide × 0.7m deep × 2.0m tall  (needs 1.5m clear passage)\n"
+        "  XL:       4.8m+ wide × 0.7m deep × 2.0m tall (needs 2.0m clear passage)\n\n"
+        "Requirements for ANY size: level paved ground, unobstructed wall/frontage,\n"
+        "no blocking of exits, wheelchair access, or shop entrances.\n\n"
+        "Images show {n_images} views ({image_summary}) of the candidate location.\n\n"
+        "Respond ONLY with valid JSON (no markdown fences):\n"
+        '{{\n'
+        '  "scene_type": "exterior"|"interior"|"covered",\n'
+        '  "is_viable_exterior": true|false,\n'
+        '  "interior_image_indices": [],\n'
+        '  "largest_viable_size": "compact"|"standard"|"large"|"xl"|"none",\n'
+        '  "placement_score": 0-10,\n'
+        '  "placement_confidence": 0.0-1.0,\n'
+        '  "confidence": "high"|"medium"|"low",\n'
+        '  "best_side": "left"|"right"|"junction"|"none",\n'
+        '  "best_image_idx": 0,\n'
+        '  "placement_x_pct": 0-100,\n'
+        '  "frame_coverage_pct": 60,\n'
+        '  "available_width_m": 1.5,\n'
+        '  "footpath_width_estimate": "e.g. ~2.5m, adequate for standard",\n'
+        '  "obstacles": ["list"],\n'
+        '  "blocked_views": ["list of image indices that are blocked/obstructed"],\n'
+        '  "wall_available": true|false,\n'
+        '  "surface": "paved"|"cobblestone"|"unpaved"|"unclear",\n'
+        '  "notes": "2-3 sentences synthesising findings from multiple angles"\n'
+        '}}\n'
+        'scene_type: classify the overall scene — exterior (street), interior (indoors), or covered (arcade/gallery).\n'
+        'is_viable_exterior: false if the scene is indoors, covered, or lacks any suitable outdoor wall/frontage.\n'
+        'interior_image_indices: 0-based indices of images that show indoor or covered scenes.\n'
+        'placement_x_pct: horizontal center of locker as % of best_image_idx width.\n'
+        'placement_confidence: 0.0-1.0 — how confident you are in the exact placement_x_pct location.\n'
+        'frame_coverage_pct: what % of image width the available wall/frontage spans (e.g. 40 if wall covers 40% of frame).\n'
+        'best_image_idx: 0-based index into the images provided (choose the clearest EXTERIOR view).\n'
+        'blocked_views: indices of images that are blocked by vehicles, construction, etc.'
+    )
+
+    all_results = []
+    model = "claude-opus-4-6"
+
+    for gi, group in enumerate(groups):
+        images = group["images"]
+        if not images:
+            print(f"    Group {gi + 1}: no valid images, skipping")
             continue
 
-        sv_url = (f"https://maps.googleapis.com/maps/api/streetview?"
-                  f"size=800x600&location={lat},{lng}"
-                  f"&heading={heading}&pitch={call.get('pitch', 5)}"
-                  f"&fov={call.get('fov', 90)}&key={api_key}")
-        fname  = img_dir / f"sv_corridor_{n}_{side}.png"
+        # Build image summary string
+        by_type = {}
+        for img in images:
+            t = img["capture_type"]
+            by_type[t] = by_type.get(t, 0) + 1
+        summary_parts = [f"{v} {k}" for k, v in sorted(by_type.items())]
+        image_summary = ", ".join(summary_parts)
+
+        prompt = grouped_prompt.format(
+            n_images=len(images),
+            image_summary=image_summary,
+        )
+
+        content = []
+        for i, img_info in enumerate(images):
+            with open(img_info["path"], "rb") as fh:
+                raw = fh.read()
+            b64 = base64.standard_b64encode(raw).decode()
+            if raw[:3] == b'\xff\xd8\xff':
+                media_type = "image/jpeg"
+            elif raw[:8] == b'\x89PNG\r\n\x1a\n':
+                media_type = "image/png"
+            else:
+                media_type = "image/jpeg"
+            content.append({
+                "type": "image",
+                "source": {"type": "base64", "media_type": media_type, "data": b64},
+            })
+            # Add label for each image
+            indoor_flag = " [HEURISTIC: likely indoor]" if img_info.get("heuristic_indoor") else ""
+            label = (f"Image {i}: VP{img_info['viewpoint_idx']} "
+                     f"{img_info['side']} (fov={img_info['fov']}° "
+                     f"{img_info['capture_type']}){indoor_flag}")
+            content.append({"type": "text", "text": label})
+        content.append({"type": "text", "text": prompt})
+
         try:
-            req2  = urllib.request.Request(sv_url, headers=HEADERS)
-            resp2 = urllib.request.urlopen(req2, timeout=15)
-            with open(fname, "wb") as fh:
-                fh.write(resp2.read())
-            saved += 1
+            req_body = json.dumps({
+                "model":      model,
+                "max_tokens": 1024,
+                "messages":   [{"role": "user", "content": content}],
+            }).encode()
+            req = urllib.request.Request(
+                "https://api.anthropic.com/v1/messages",
+                data=req_body,
+                headers={
+                    "x-api-key":         api_key,
+                    "anthropic-version": "2023-06-01",
+                    "content-type":      "application/json",
+                },
+                method="POST",
+            )
+            resp = urllib.request.urlopen(req, timeout=60)
+            body = json.loads(resp.read().decode())
+            raw_text = body["content"][0]["text"].strip()
+            if raw_text.startswith("```"):
+                raw_text = raw_text.split("```")[1]
+                if raw_text.startswith("json"):
+                    raw_text = raw_text[4:]
+            analysis = json.loads(raw_text)
         except Exception as e:
-            print(f"    corridor SV {n}_{side}: download failed: {e}")
+            print(f"    Group {gi + 1}: analysis failed ({e})")
+            analysis = {"largest_viable_size": "none", "placement_score": 0,
+                        "confidence": "low",
+                        "notes": f"analysis error: {e}"}
 
-        time.sleep(0.15)
+        center = group["center"]
+        # Find best viewpoint (closest to center with best images)
+        best_vp = None
+        for call in group["calls"]:
+            if best_vp is None:
+                best_vp = call
+            elif haversine(call["lat"], call["lng"], center[0], center[1]) < \
+                 haversine(best_vp["lat"], best_vp["lng"], center[0], center[1]):
+                best_vp = call
 
-    print(f"  Corridor images saved: {saved}/{len(sv_calls)}")
+        result = {
+            "group_idx": gi,
+            "center_lat": center[0],
+            "center_lng": center[1],
+            "n_images": len(images),
+            "image_types": by_type,
+            "images": images,
+            "analysis": analysis,
+            "viewpoint_idx": best_vp.get("viewpoint_idx", 0) if best_vp else 0,
+            "lat": best_vp["lat"] if best_vp else center[0],
+            "lng": best_vp["lng"] if best_vp else center[1],
+            "idw_score": best_vp.get("idw_score", 0) if best_vp else 0,
+        }
+        all_results.append(result)
+        score = analysis.get("placement_score", 0)
+        size = analysis.get("largest_viable_size", "none")
+        conf = analysis.get("confidence", "?")
+        scene = analysis.get("scene_type", "?")
+        viable = analysis.get("is_viable_exterior", True)
+        scene_tag = f" [INTERIOR]" if scene != "exterior" or not viable else ""
+        print(f"    Group {gi + 1}: score={score}/10 size={size} "
+              f"confidence={conf} scene={scene}{scene_tag} ({len(images)} images)")
+        time.sleep(0.5)
+
+    # Filter top candidates
+    min_score = cfg.get("candidate_min_score", 5)
+    top_candidates = sorted(
+        [r for r in all_results
+         if r["analysis"].get("placement_score", 0) >= min_score
+         and r["analysis"].get("wall_available", False)
+         and r["analysis"].get("is_viable_exterior", True)],
+        key=lambda x: x["analysis"].get("placement_score", 0),
+        reverse=True,
+    )
+
+    # Build interesting coords for compatibility
+    interesting_out = [
+        (r["lat"], r["lng"])
+        for r in all_results
+        if r["analysis"].get("placement_score", 0) >= min_score
+    ]
+
+    n_viable = sum(1 for r in all_results
+                   if r["analysis"].get("largest_viable_size", "none") != "none")
+
+    output_dict = {
+        "meta": {
+            "pass":         "grouped_detail",
+            "sector":       "unknown",
+            "model":        model,
+            "version":      SV_ANALYSIS_VERSION,
+            "n_groups":     len(groups),
+            "n_analysed":   len(all_results),
+            "n_viable":     n_viable,
+            "n_top":        len(top_candidates),
+            "config":       {k: v for k, v in cfg.items() if not k.startswith("_")},
+            "at":           datetime.utcnow().isoformat(),
+        },
+        "candidate_groups":  all_results,
+        "top_candidates":    top_candidates,
+        "interesting_coords": interesting_out,
+        # Compatibility: viewpoints list (one per group)
+        "viewpoints":        all_results,
+    }
+
+    if output_path:
+        output_path = Path(output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+
+        class _SafeEnc(json.JSONEncoder):
+            def default(self, obj):
+                try:
+                    import numpy as np
+                    if isinstance(obj, (np.integer,)):  return int(obj)
+                    if isinstance(obj, (np.floating,)): return float(obj)
+                except ImportError:
+                    pass
+                return super().default(obj)
+
+        with open(output_path, "w") as fh:
+            json.dump(output_dict, fh, indent=2, cls=_SafeEnc)
+        print(f"  Grouped analysis saved → {output_path.name} "
+              f"({n_viable}/{len(all_results)} viable, "
+              f"{len(top_candidates)} top candidates)")
+
+    return output_dict
+
+
+def _sv_candidates_to_ground_truth(grouped_analysis, corridor_meta, data_dir,
+                                     config=None):
+    """Convert SV corridor top candidates to ground-truth candidate format.
+
+    Bridges the SV pipeline output into the enrichment pipeline's expected
+    dict structure so we can reuse reverse_geocode, describe_candidates,
+    collect_zoning_data, etc.
+
+    Returns list of candidate dicts compatible with the ground-truth pipeline.
+    """
+    cfg = config or SV_CONFIG
+    top = grouped_analysis.get("top_candidates", [])
+    if not top:
+        print("  No top candidates to convert")
+        return []
+
+    # Load baseline lockers + competitors for distance calc
+    project_root = Path(__file__).resolve().parent.parent
+    baseline = []
+    competitors = []
+    try:
+        bbox_path = project_root / "data" / "bbox.json"
+        if bbox_path.exists():
+            with open(bbox_path) as f:
+                baseline = json.load(f)
+    except Exception:
+        pass
+    try:
+        comp_path = project_root / "data" / "competitors.json"
+        if comp_path.exists():
+            with open(comp_path) as f:
+                competitors = json.load(f)
+    except Exception:
+        pass
+
+    candidates = []
+    for i, cand in enumerate(top):
+        lat = cand.get("lat", cand.get("center_lat", 0))
+        lng = cand.get("lng", cand.get("center_lng", 0))
+        analysis = cand.get("analysis", {})
+
+        # Compute nearest existing locker
+        nearest_m = 9999
+        for loc in baseline:
+            d = haversine(lat, lng, loc.get("lat", 0), loc.get("lng", 0))
+            if d < nearest_m:
+                nearest_m = d
+
+        # Count competitors within 500m
+        comp_nearby = sum(
+            1 for c in competitors
+            if haversine(lat, lng, c.get("lat", 0), c.get("lng", 0)) < 500
+        )
+
+        candidates.append({
+            "id": i + 1,
+            "lat": round(lat, 5),
+            "lng": round(lng, 5),
+            "sector": corridor_meta.get("meta", {}).get("sector", "unknown"),
+            "source": "sv_corridor",
+            "ml_score": cand.get("idw_score", 0),
+            "site_score": 0,
+            "gt_score": 0,
+            "address": "",  # Filled by reverse_geocode_address
+            "suggested_site": None,  # Filled by describe_candidates
+            "nearest_existing_m": round(nearest_m),
+            "competitors_nearby": comp_nearby,
+            "pop_gain": 0,
+            "commentary": "",
+            "contact_info": "",
+            "status": "proposed",
+            # SV-specific fields carried forward
+            "sv_viewpoint_idx": cand.get("viewpoint_idx", 0),
+            "sv_group_idx": cand.get("group_idx", 0),
+            "sv_placement_score": analysis.get("placement_score", 0),
+            "sv_largest_viable_size": analysis.get("largest_viable_size", "none"),
+            "sv_confidence": analysis.get("confidence", "low"),
+            "sv_surface": analysis.get("surface", "unclear"),
+            "sv_wall_available": analysis.get("wall_available", False),
+            "sv_obstacles": analysis.get("obstacles", []),
+            "sv_notes": analysis.get("notes", ""),
+            "sv_available_width_m": analysis.get("available_width_m", 0),
+            "sv_footpath_estimate": analysis.get("footpath_width_estimate", ""),
+            "sv_best_side": analysis.get("best_side", "none"),
+            "sv_scene_type": analysis.get("scene_type", "exterior"),
+            "sv_is_viable_exterior": analysis.get("is_viable_exterior", True),
+            "sv_interior_image_indices": analysis.get("interior_image_indices", []),
+            "sv_placement_confidence": analysis.get("placement_confidence", 0.5),
+            "sv_frame_coverage_pct": analysis.get("frame_coverage_pct", 60),
+            "sv_images": cand.get("images", []),
+            "sv_analysis": analysis,
+        })
+
+    print(f"  Converted {len(candidates)} SV candidates to ground-truth format")
+    return candidates
+
+
+def _enrich_sv_candidates_with_claude(candidates, zoning, center, commune, region,
+                                       img_dir=None, sv_corridor=None):
+    """Final Opus assessment for SV corridor candidates.
+
+    Extends enrich_with_claude() pattern — sends SV corridor images + satellite +
+    all enrichment data for comprehensive feasibility assessment.
+
+    Includes all 4 locker sizes and SV analysis findings in the prompt.
+    If no candidate is truly feasible, sets recommendation.winner_id = null.
+    """
+    try:
+        from dotenv import load_dotenv
+        load_dotenv(Path(__file__).resolve().parent.parent / ".env", override=True)
+    except ImportError:
+        pass
+
+    api_key = os.getenv("ANTHROPIC_API_KEY")
+    if not api_key:
+        print("  _enrich_sv_candidates_with_claude: no ANTHROPIC_API_KEY, skipping")
+        return None
+
+    import base64
+    from datetime import datetime
+
+    try:
+        import anthropic
+        client = anthropic.Anthropic(api_key=api_key)
+    except ImportError:
+        print("  _enrich_sv_candidates_with_claude: anthropic SDK not installed, skipping")
+        return None
+
+    print(f"  Final Opus assessment for {len(candidates)} SV candidates...")
+
+    # Cap candidates to stay under Anthropic's 100 image limit
+    # Budget: ~7 images per candidate (1 satellite + 6 SV), so max ~14 candidates
+    MAX_IMAGES = 95  # leave headroom
+    IMAGES_PER_CANDIDATE = 7  # 1 satellite + 6 SV
+    max_candidates = max(3, MAX_IMAGES // IMAGES_PER_CANDIDATE)
+    if len(candidates) > max_candidates:
+        # Sort by SV placement score descending, take top N
+        candidates_ranked = sorted(candidates,
+                                   key=lambda c: c.get("sv_placement_score", 0),
+                                   reverse=True)
+        assessed = candidates_ranked[:max_candidates]
+        skipped = candidates_ranked[max_candidates:]
+        print(f"    Capping to top {max_candidates} candidates (by SV score) to stay under image limit")
+        # Mark skipped candidates as not assessed
+        for c in skipped:
+            c["verdict"] = "Not assessed"
+            c["commentary"] = "Candidate not assessed in final review — lower SV placement score"
+    else:
+        assessed = candidates
+
+    # Build evidence JSON for each candidate
+    evidence = []
+    for c in assessed:
+        ev = {
+            "id": c["id"],
+            "lat": c["lat"],
+            "lng": c["lng"],
+            "address": c.get("address", ""),
+            "sector": c.get("sector", ""),
+            "source": c.get("source", "sv_corridor"),
+            "ml_score": c.get("ml_score", 0),
+            "nearest_existing_m": c.get("nearest_existing_m", 9999),
+            "competitors_nearby": c.get("competitors_nearby", 0),
+            "sv_placement_score": c.get("sv_placement_score", 0),
+            "sv_largest_viable_size": c.get("sv_largest_viable_size", "none"),
+            "sv_confidence": c.get("sv_confidence", "low"),
+            "sv_surface": c.get("sv_surface", ""),
+            "sv_wall_available": c.get("sv_wall_available", False),
+            "sv_obstacles": c.get("sv_obstacles", []),
+            "sv_notes": c.get("sv_notes", ""),
+            "sv_available_width_m": c.get("sv_available_width_m", 0),
+            "sv_footpath_estimate": c.get("sv_footpath_estimate", ""),
+        }
+        # Add enrichment data if available
+        if c.get("location_context"):
+            ev["location_context"] = c["location_context"]
+        if c.get("nearby_pois"):
+            ev["nearby_pois"] = c["nearby_pois"][:5]
+        if c.get("suggested_site"):
+            ev["suggested_site"] = c["suggested_site"]
+        if c.get("zoning_data"):
+            ev["zoning_data"] = c["zoning_data"]
+        if c.get("heritage_zones"):
+            ev["heritage_zones"] = c["heritage_zones"]
+        if c.get("physical_context"):
+            ev["physical_context"] = c["physical_context"]
+        if c.get("business_details"):
+            ev["business_details"] = c["business_details"]
+        evidence.append(ev)
+
+    # Regulation names by region
+    reg_names = {
+        "Brussels-Capital": "COBAT (Code bruxellois de l'Aménagement du Territoire)",
+        "Wallonia": "CoDT (Code du Développement Territorial)",
+        "Flanders": "VCRO (Vlaamse Codex Ruimtelijke Ordening)",
+    }
+    reg = reg_names.get(region, "applicable regional planning code")
+
+    prompt = (
+        f"You are a senior urban logistics consultant assessing parcel locker placement "
+        f"in {commune}, {region} (Belgium). The {reg} applies.\n\n"
+        f"## Available locker sizes\n"
+        f"  Compact:  0.6m W × 0.7m D × 2.0m H  (needs 1.2m clear passage)\n"
+        f"  Standard: 1.2m W × 0.7m D × 2.0m H  (needs 1.5m clear passage)\n"
+        f"  Large:    2.4m W × 0.7m D × 2.0m H  (needs 1.5m clear passage)\n"
+        f"  XL:       4.8m+ W × 0.7m D × 2.0m H (needs 2.0m clear passage)\n\n"
+        f"## Space requirements\n"
+        f"- Level paved ground, firm surface\n"
+        f"- Unobstructed wall or building frontage\n"
+        f"- Must not block emergency exits, wheelchair access, or shop entrances\n"
+        f"- 1.5m minimum clear passage for pedestrians (1.2m for compact only)\n\n"
+        f"## Candidate evidence\n"
+        f"Each candidate includes street-level observations from multiple camera angles,\n"
+        f"satellite imagery, and enrichment data from OpenStreetMap and regional planning APIs.\n\n"
+        f"The SV corridor analysis has already scored each candidate on a 0-10 scale.\n"
+        f"Your task is to provide an independent feasibility assessment using ALL available data,\n"
+        f"including the street-level and satellite imagery provided.\n\n"
+        f"```json\n{json.dumps(evidence, indent=2, default=str)}\n```\n\n"
+        f"## Instructions\n"
+        f"1. Examine ALL images for each candidate (satellite + street view angles)\n"
+        f"2. Cross-reference the SV analysis findings with what you see in the images\n"
+        f"3. Consider zoning, heritage, and physical infrastructure data\n"
+        f"4. Determine the LARGEST viable locker size, considering all 4 options\n"
+        f"5. If NO candidate is truly feasible, say so explicitly and explain why\n\n"
+        f"Respond ONLY with valid JSON (no markdown fences):\n"
+        f'{{\n'
+        f'  "candidate_assessments": {{\n'
+        f'    "<id>": {{\n'
+        f'      "commentary": "2-3 sentence summary of feasibility",\n'
+        f'      "physical_feasibility": {{\n'
+        f'        "verdict": "Feasible"|"Marginal"|"Not feasible",\n'
+        f'        "footpath_assessment": "...",\n'
+        f'        "space_assessment": "...",\n'
+        f'        "accessibility": "...",\n'
+        f'        "visibility_traffic": "...",\n'
+        f'        "obstacles": "..."\n'
+        f'      }},\n'
+        f'      "visual_observations": [\n'
+        f'        {{"label": "short label", "description": "1-2 sentences"}}\n'
+        f'      ],\n'
+        f'      "contact_details": {{\n'
+        f'        "site_type": "private"|"public",\n'
+        f'        "business_name": "...",\n'
+        f'        "parent_company": "...",\n'
+        f'        "contact_approach": "specific recommendation",\n'
+        f'        "phone_website": "...",\n'
+        f'        "commune_authority": "..."\n'
+        f'      }}\n'
+        f'    }}\n'
+        f'  }},\n'
+        f'  "zoning_analysis": {{\n'
+        f'    "zone_classification": "...",\n'
+        f'    "applicable_regulations": "...",\n'
+        f'    "permits_required": "...",\n'
+        f'    "approval_timeline": "...",\n'
+        f'    "special_plan_restrictions": "..."\n'
+        f'  }},\n'
+        f'  "recommendation": {{\n'
+        f'    "winner_id": <int or null if none feasible>,\n'
+        f'    "reasoning": "3-5 sentences explaining the recommendation",\n'
+        f'    "next_steps": ["Step 1: ...", "Step 2: ...", "Step 3: ..."]\n'
+        f'  }}\n'
+        f'}}'
+    )
+
+    # Build content with images
+    content = []
+
+    # Add satellite + SV images for assessed candidates only
+    for c in assessed:
+        cid = c["id"]
+        # Satellite image
+        if img_dir:
+            sat_path = Path(img_dir) / f"candidate_{cid}_satellite.png"
+            if sat_path.exists():
+                with open(sat_path, "rb") as fh:
+                    raw = fh.read()
+                b64 = base64.standard_b64encode(raw).decode()
+                mt = "image/jpeg" if raw[:3] == b'\xff\xd8\xff' else "image/png"
+                content.append({
+                    "type": "image",
+                    "source": {"type": "base64", "media_type": mt, "data": b64},
+                })
+                content.append({"type": "text",
+                                "text": f"Candidate {cid}: satellite view"})
+
+        # SV corridor images (max 6 per candidate)
+        sv_images = c.get("sv_images", [])[:6]
+        for si, img_info in enumerate(sv_images):
+            img_path = Path(img_info["path"]) if isinstance(img_info, dict) else Path(img_info)
+            if img_path.exists():
+                with open(img_path, "rb") as fh:
+                    raw = fh.read()
+                b64 = base64.standard_b64encode(raw).decode()
+                mt = "image/jpeg" if raw[:3] == b'\xff\xd8\xff' else "image/png"
+                content.append({
+                    "type": "image",
+                    "source": {"type": "base64", "media_type": mt, "data": b64},
+                })
+                label = f"Candidate {cid}: street view"
+                if isinstance(img_info, dict):
+                    label += f" ({img_info.get('side', '')} fov={img_info.get('fov', 90)}°)"
+                content.append({"type": "text", "text": label})
+
+    content.append({"type": "text", "text": prompt})
+
+    try:
+        response = client.messages.create(
+            model="claude-opus-4-6",
+            max_tokens=16000,
+            thinking={"type": "adaptive"},
+            messages=[{"role": "user", "content": content}],
+        )
+
+        # Extract text from response (skip thinking blocks)
+        raw_text = ""
+        for block in response.content:
+            if hasattr(block, "text"):
+                raw_text = block.text.strip()
+                break
+
+        if raw_text.startswith("```"):
+            raw_text = raw_text.split("```")[1]
+            if raw_text.startswith("json"):
+                raw_text = raw_text[4:]
+
+        result = json.loads(raw_text)
+
+    except Exception as e:
+        print(f"  Final Opus assessment failed: {e}")
+        return None
+
+    # Merge results onto candidates
+    assessments = result.get("candidate_assessments", {})
+    for c in candidates:
+        cid = str(c["id"])
+        if cid in assessments:
+            a = assessments[cid]
+            c["commentary"] = a.get("commentary", "")
+            c["physical_feasibility"] = a.get("physical_feasibility", {})
+            c["visual_observations"] = a.get("visual_observations", [])
+            c["contact_details"] = a.get("contact_details", {})
+            # Build backward-compatible contact_info string
+            cd = c["contact_details"]
+            parts = [cd.get("business_name", ""), cd.get("phone_website", "")]
+            c["contact_info"] = " | ".join(p for p in parts if p)
+
+    # Compute cost
+    input_tokens = getattr(response, "usage", None)
+    cost = 0
+    if input_tokens:
+        cost = (getattr(input_tokens, "input_tokens", 0) * 15 +
+                getattr(input_tokens, "output_tokens", 0) * 75) / 1_000_000
+
+    enrichment = {
+        "zoning_analysis": result.get("zoning_analysis", {}),
+        "zoning_findings": json.dumps(result.get("zoning_analysis", {})),
+        "recommendation": result.get("recommendation", {}),
+        "overall_recommendation": result.get("recommendation", {}).get("reasoning", ""),
+        "model_used": "claude-opus-4-6",
+        "enriched_at": datetime.utcnow().isoformat(),
+        "cost_usd": round(cost, 4),
+    }
+
+    winner_id = result.get("recommendation", {}).get("winner_id")
+    if winner_id:
+        print(f"  Recommendation: Candidate #{winner_id}")
+    else:
+        print(f"  Recommendation: No feasible candidate")
+    print(f"  Cost: ${enrichment['cost_usd']:.4f}")
+
+    return enrichment
 
 
 def _download_esri_tiles(candidates, img_dir):
@@ -2250,6 +4047,10 @@ def main():
     parser.add_argument("--approved", help="Path to approved_locations.json")
     parser.add_argument("--name", help="Area name for the report (auto-generated if omitted)")
     parser.add_argument("--enrich", action="store_true", help="Enrich with Claude API commentary")
+    parser.add_argument("--resume-from", choices=["detail", "enrich", "assess", "pdf"],
+                        help="v2.0: Resume SV pipeline from a specific stage (skips earlier stages)")
+    parser.add_argument("--sv-only", action="store_true",
+                        help="Skip ground-truth Steps 2-8, run only SV corridor pipeline")
     args = parser.parse_args()
 
     if not args.center and not args.sector and not (args.lat and args.lng):
@@ -2270,55 +4071,297 @@ def main():
               f"demand={sector_summary['demand']:.0f}, competitors={sector_summary.get('competitor_count', 0)}, "
               f"quadrant={q}")
 
-    # Step 2: Query OSM data
-    osm_features = fetch_osm_data(center, args.radius)
-
-    # Step 3: Identify ALL nearby candidate sites (collect a pool)
-    all_candidates = identify_candidates(center, args.radius, data, osm_features,
-                                         max_candidates=args.candidates * 5)  # Larger pool for iteration
-
-    if not all_candidates:
-        print("\nNo candidates found in this area. Try a larger radius or different center.")
-        return
-
-    # Step 4: Describe/score all candidates (cheap, local)
-    ml_mode = data.get("ml_heatmap") is not None
-    if ml_mode:
-        all_scored = describe_candidates(all_candidates, osm_features, data, center=center)
-    else:
-        all_scored = score_candidates(all_candidates, osm_features, data, center=center)
-
-    # Step 5: Zoning research
+    # Resolve commune/region early (needed for both paths)
     commune, region = reverse_geocode_commune(center[0], center[1])
     area_name = args.name or f"{commune.replace(' ', '-').replace('/', '-')}_{args.radius}km"
-    zoning = build_zoning_research(center, commune, region)
 
-    # Steps 3b-5b: Collect zoning, business, physical data for ALL candidates
-    collect_zoning_data(all_scored, commune, region)
-    collect_business_data(all_scored)
-    collect_physical_data(all_scored)
-
-    # Prepare report directory + images
+    # Prepare report directory
+    resume = getattr(args, "resume_from", None)
     date_str = time.strftime("%Y%m%d")
     report_dir = REPORTS_DIR / f"{area_name}_{date_str}"
+    # When resuming, prefer existing directory with checkpoints
+    if resume:
+        existing = sorted(REPORTS_DIR.glob(f"{area_name}_*"), reverse=True)
+        for d in existing:
+            if d.is_dir() and (d / "sv_screen_analysis.json").exists():
+                report_dir = d
+                print(f"  Resuming from existing report directory: {d.name}")
+                break
     report_dir.mkdir(parents=True, exist_ok=True)
     img_dir = report_dir / "images"
     img_dir.mkdir(exist_ok=True)
 
-    # Take top N candidates for the report
-    n = args.candidates
-    scored = all_scored[:n]
+    scored = []
+    zoning = {}
+    osm_features = {}
 
-    # Step 6: Download imagery for current batch
-    download_candidate_images(scored, img_dir)
-    download_overview_image(center, scored, img_dir)
+    if not getattr(args, "sv_only", False):
+        # Step 2: Query OSM data
+        osm_features = fetch_osm_data(center, args.radius)
 
-    # Step 6b: Build ML corridor + download Street View sweep (sector mode only)
+        # Step 3: Identify ALL nearby candidate sites (collect a pool)
+        all_candidates = identify_candidates(center, args.radius, data, osm_features,
+                                             max_candidates=args.candidates * 5)
+
+        if not all_candidates:
+            print("\nNo candidates found in this area. Try a larger radius or different center.")
+            if not args.sector:
+                return
+
+        if all_candidates:
+            # Step 4: Describe/score all candidates (cheap, local)
+            ml_mode = data.get("ml_heatmap") is not None
+            if ml_mode:
+                all_scored = describe_candidates(all_candidates, osm_features, data, center=center)
+            else:
+                all_scored = score_candidates(all_candidates, osm_features, data, center=center)
+
+            # Step 5: Zoning research
+            zoning = build_zoning_research(center, commune, region)
+
+            # Steps 3b-5b: Collect zoning, business, physical data for ALL candidates
+            collect_zoning_data(all_scored, commune, region)
+            collect_business_data(all_scored)
+            collect_physical_data(all_scored)
+
+            # Take top N candidates for the report
+            n = args.candidates
+            scored = all_scored[:n]
+
+            # Step 6: Download imagery for current batch
+            download_candidate_images(scored, img_dir)
+            download_overview_image(center, scored, img_dir)
+    else:
+        print("  --sv-only: skipping ground-truth Steps 2-8, jumping to SV corridor")
+        zoning = build_zoning_research(center, commune, region)
+
+    # Step 6b: SV Corridor v2.0 — full pipeline with checkpoint/resume
     sv_corridor = None
+
     if args.sector:
         sv_corridor = build_sv_corridor(args.sector)
         if sv_corridor:
-            download_sv_corridor_images(sv_corridor["sv_calls"], img_dir)
+            pts    = sv_corridor["corridor_points"]
+            gn     = sv_corridor.get("_graph_nodes", {})
+            ge     = sv_corridor.get("_graph_edges", {})
+
+            screen_analysis = None
+            detail_analysis = None
+            sv_candidates = []
+            sv_enrichment = None
+
+            # ── PASS 1: SCREENING ──────────────────────────────────
+            screen_json = report_dir / "sv_screen_analysis.json"
+            if resume and resume != "detail":
+                # Skip screening — load from checkpoint
+                if screen_json.exists():
+                    with open(screen_json) as f:
+                        screen_analysis = json.load(f)
+                    print(f"  Loaded screening checkpoint ({screen_analysis.get('meta',{}).get('n_analysed',0)} viewpoints)")
+            if screen_analysis is None and (resume is None or resume == "detail"):
+                screen_calls = _build_screening_sv_calls(pts, stride=SV_CONFIG["screening_stride"])
+                download_sv_corridor_images(screen_calls, img_dir, prefix="screen_")
+                screen_analysis = analyze_sv_corridor_images(
+                    screen_calls, img_dir,
+                    prefix="screen_",
+                    model="claude-sonnet-4-6",
+                    output_path=screen_json,
+                    interesting_threshold=SV_CONFIG["screening_threshold"],
+                )
+            # Patch sector code into screening meta
+            if screen_analysis and screen_analysis.get("meta", {}).get("sector") == "unknown":
+                screen_analysis["meta"]["sector"] = args.sector
+                screen_analysis["meta"]["sector_code"] = args.sector
+                with open(screen_json, "w") as f:
+                    json.dump(screen_analysis, f, indent=2, default=str)
+
+            elif screen_analysis is None and screen_json.exists():
+                with open(screen_json) as f:
+                    screen_analysis = json.load(f)
+
+            # ── PASS 2: MULTI-ANGLE DETAIL ─────────────────────────
+            detail_json = report_dir / "sv_detail_analysis.json"
+            interesting = (screen_analysis or {}).get("interesting_coords", [])
+
+            if resume in ("enrich", "assess", "pdf") and detail_json.exists():
+                # Skip detail — load from checkpoint
+                with open(detail_json) as f:
+                    detail_analysis = json.load(f)
+                print(f"  Loaded detail checkpoint ({detail_analysis.get('meta',{}).get('n_groups', detail_analysis.get('meta',{}).get('n_analysed',0))} groups)")
+            elif interesting:
+                # v2.0: Multi-angle detail capture + grouped analysis
+                detail_calls = _build_detail_sv_calls_v2(pts, interesting, gn, ge,
+                                                          config=SV_CONFIG)
+                download_sv_corridor_images(detail_calls, img_dir, prefix="detail_")
+                detail_analysis = analyze_sv_corridor_grouped(
+                    detail_calls, img_dir, interesting,
+                    prefix="detail_",
+                    config=SV_CONFIG,
+                    output_path=detail_json,
+                )
+            else:
+                print("  No interesting spots found in screening pass")
+
+            # Patch sector code into detail meta
+            if detail_analysis and detail_analysis.get("meta", {}).get("sector") == "unknown":
+                detail_analysis["meta"]["sector"] = args.sector
+                detail_analysis["meta"]["sector_code"] = args.sector
+                with open(detail_json, "w") as f:
+                    json.dump(detail_analysis, f, indent=2, default=str)
+
+            # ── CANDIDATE CONVERSION & ENRICHMENT ──────────────────
+            enrichment_json = report_dir / "sv_enrichment.json"
+
+            if resume in ("assess", "pdf") and enrichment_json.exists():
+                with open(enrichment_json) as f:
+                    sv_enrichment_data = json.load(f)
+                    sv_candidates = sv_enrichment_data.get("candidates", [])
+                    sv_enrichment = sv_enrichment_data
+                print(f"  Loaded enrichment checkpoint ({len(sv_candidates)} candidates)")
+            elif detail_analysis:
+                top = detail_analysis.get("top_candidates", [])
+                if top:
+                    # Convert to ground-truth format
+                    sv_candidates = _sv_candidates_to_ground_truth(
+                        detail_analysis, sv_corridor, report_dir,
+                        config=SV_CONFIG)
+
+                    if sv_candidates and resume != "pdf":
+                        # Reverse geocode addresses
+                        for c in sv_candidates:
+                            c["address"] = reverse_geocode_address(c["lat"], c["lng"])
+                            time.sleep(1.1)
+
+                        # Run enrichment pipeline (reuse ground-truth functions)
+                        try:
+                            osm_for_sv = fetch_osm_data(center, args.radius)
+                            sv_candidates = describe_candidates(sv_candidates, osm_for_sv, data, center)
+                        except Exception as e:
+                            print(f"  describe_candidates: {e}")
+
+                        try:
+                            collect_zoning_data(sv_candidates, commune, region)
+                        except Exception as e:
+                            print(f"  collect_zoning_data: {e}")
+
+                        try:
+                            collect_business_data(sv_candidates)
+                        except Exception as e:
+                            print(f"  collect_business_data: {e}")
+
+                        try:
+                            collect_physical_data(sv_candidates)
+                        except Exception as e:
+                            print(f"  collect_physical_data: {e}")
+
+                        # Download satellite images for each candidate
+                        download_candidate_images(sv_candidates, img_dir)
+                        download_overview_image(center, sv_candidates, img_dir)
+
+                        # Final Opus assessment
+                        sv_enrichment = _enrich_sv_candidates_with_claude(
+                            sv_candidates, zoning, center, commune, region,
+                            img_dir=img_dir, sv_corridor=sv_corridor)
+
+                        # Save enrichment checkpoint
+                        if sv_enrichment:
+                            checkpoint = dict(sv_enrichment)
+                            checkpoint["candidates"] = sv_candidates
+                            with open(enrichment_json, "w") as f:
+                                json.dump(checkpoint, f, indent=2, default=str)
+                            print(f"  Enrichment saved → {enrichment_json.name}")
+                else:
+                    print("  No top candidates from detail analysis")
+
+            # ── CONDITIONAL MARKUP ─────────────────────────────────
+            if detail_analysis and sv_candidates:
+                import importlib.util
+                _sv_spec = importlib.util.spec_from_file_location(
+                    "markup_sv", Path(__file__).resolve().parent / "markup_sv.py")
+                _sv_mod = importlib.util.module_from_spec(_sv_spec)
+                _sv_spec.loader.exec_module(_sv_mod)
+                markup_sv_image_3d = _sv_mod.markup_sv_image_3d
+                markup_sv_image = _sv_mod.markup_sv_image
+                generate_sv_report = _sv_mod.generate_sv_report
+                _should_markup = _sv_mod._should_markup
+                marked = 0
+                for c in sv_candidates:
+                    if not _should_markup(c):
+                        reason = c.get("markup_skipped_reason", "verdict not Feasible/Marginal")
+                        print(f"    skip markup: candidate {c.get('id','?')} — {reason}")
+                        continue
+                    vidx = c.get("sv_viewpoint_idx", 0)
+                    best_side = c.get("sv_best_side", "left")
+                    analysis = c.get("sv_analysis", {})
+                    sv_images = c.get("sv_images", [])
+
+                    # Build prioritised search: sv_images paths first, then fallback patterns
+                    # Priority: standard best_side > tight best_side > wide > any standard
+                    # best_image_idx from Opus used as tiebreaker within same tier
+                    best_img_idx = analysis.get("best_image_idx")
+                    def _img_priority(img_info):
+                        ct = img_info.get("capture_type", "standard")
+                        side = img_info.get("side", "")
+                        indoor_penalty = 10 if img_info.get("heuristic_indoor", False) else 0
+                        idx_bonus = 0 if img_info.get("_orig_idx") == best_img_idx else 1
+                        base_side = best_side.split("_")[-1] if "_" in best_side else best_side
+                        if base_side in side and ct == "standard": return (0 + indoor_penalty) * 10 + idx_bonus
+                        if base_side in side and ct == "tight": return (2 + indoor_penalty) * 10 + idx_bonus
+                        if ct == "wide": return (4 + indoor_penalty) * 10 + idx_bonus
+                        if ct == "standard": return (6 + indoor_penalty) * 10 + idx_bonus
+                        return (8 + indoor_penalty) * 10 + idx_bonus
+
+                    indexed_images = []
+                    for i, img in enumerate(sv_images):
+                        if isinstance(img, dict):
+                            d = dict(img)
+                            d["_orig_idx"] = i
+                            indexed_images.append(d)
+
+                    sorted_images = sorted(indexed_images, key=_img_priority)
+
+                    found = False
+                    for img_info in sorted_images:
+                        src = Path(img_info["path"])
+                        if src.exists():
+                            side_label = img_info.get("side", best_side)
+                            img_fov = img_info.get("fov", 90)
+                            out = img_dir / f"sv_marked_{vidx}_{side_label}.png"
+                            if markup_sv_image_3d(src, analysis, out, fov=img_fov):
+                                marked += 1
+                                found = True
+                            break
+
+                    if not found:
+                        # Fallback: try reconstructing filenames (default FOV=90)
+                        for side in [best_side, "left", "right",
+                                     f"wide_{best_side}", f"tight_{best_side}"]:
+                            src = img_dir / f"detail_sv_{vidx}_{side}.png"
+                            if src.exists():
+                                out = img_dir / f"sv_marked_{vidx}_{side}.png"
+                                if markup_sv_image_3d(src, analysis, out, fov=90):
+                                    marked += 1
+                                break
+                print(f"  Marked {marked} viable candidate images")
+
+                # Generate sv_report.json
+                generate_sv_report(detail_analysis, img_dir,
+                                   report_dir / "sv_report.json",
+                                   enriched_candidates=sv_candidates)
+
+            # ── PDF GENERATION ─────────────────────────────────────
+            try:
+                import importlib.util
+                _pdf_spec = importlib.util.spec_from_file_location(
+                    "sv_report_to_pdf", Path(__file__).resolve().parent / "sv_report_to_pdf.py")
+                _pdf_mod = importlib.util.module_from_spec(_pdf_spec)
+                _pdf_spec.loader.exec_module(_pdf_mod)
+                generate_sv_report_pdf = _pdf_mod.generate_sv_report_pdf
+                generate_sv_report_pdf(report_dir)
+            except Exception as e:
+                print(f"  PDF generation failed: {e}")
+                import traceback
+                traceback.print_exc()
 
     # Step 7 (optional): Claude API enrichment with feasibility iteration
     ai_enrichment = None
