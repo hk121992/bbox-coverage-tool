@@ -1,0 +1,39 @@
+PROJECT: bbox-coverage-tool
+LAST UPDATED: 2026-03-03
+STATUS: Active — awaiting next task from Middle Management
+
+## Current State
+
+The project is complete and deployed. A fully functional interactive map tool for analysing bpost bbox parcel locker coverage across Belgium is live at https://hk121992.github.io/bbox-coverage-tool/
+
+All core features are implemented:
+- Population-weighted and demand-weighted coverage modes
+- MCLP optimisation algorithm for new locker placement
+- Supermarket top-up placement phase
+- Guided walkthrough/tutorial
+- Coverage charts and visualisations
+
+## Last Session
+
+- Refactored ui.js and walkthrough.js (extracted shared helpers, removed ~170 lines of duplication)
+- Updated README with live URL and SM top-up description
+- No behaviour changes
+
+## Tech State
+
+- Frontend: vanilla JS + Leaflet + Chart.js — no build step needed
+- Data: precomputed JSON files in data/ (~80MB total)
+- Deployment: GitHub Pages (auto-deploys on push to main)
+- Python pipeline: scripts/ handles data refresh (run manually when data sources update)
+
+## Next Steps
+
+Awaiting direction from PM. Possible areas:
+- UI/UX improvements
+- New coverage analysis features
+- Data pipeline updates (new StatBel/OSM data)
+- Performance optimisation for large datasets
+
+## Blockers
+
+None.
