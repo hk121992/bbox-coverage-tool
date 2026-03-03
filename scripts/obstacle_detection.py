@@ -20,11 +20,12 @@ _model = None
 
 # COCO classes that constitute obstacles for locker placement
 OBSTACLE_CLASSES = {
-    0: "person", 1: "bicycle", 2: "car", 3: "motorcycle",
+    1: "bicycle", 2: "car", 3: "motorcycle",
     5: "bus", 7: "truck", 9: "traffic light", 10: "fire hydrant",
     11: "stop sign", 12: "parking meter", 13: "bench",
     56: "chair", 58: "potted plant", 60: "dining table",
 }
+# Note: "person" (class 0) deliberately excluded — people are moveable, not permanent obstacles
 
 
 def _load_model():

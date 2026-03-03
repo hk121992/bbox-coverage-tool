@@ -120,6 +120,102 @@ def _detect_open_space(analysis):
     }
 
 
+def _compute_sidewalk_zone(yolo_obstacles, best_side, W, H):
+    """Infer sidewalk x-range from best_side + YOLO vehicle detections.
+
+    Strategy: `best_side` tells us which side of the image has the building
+    wall/frontage. The sidewalk is on that side. Vehicles help refine the
+    boundary, but best_side is the primary signal.
+
+    In street-level SV images looking perpendicular to the street:
+    - best_side="left"  → building is LEFT, sidewalk ≈ x ∈ [5%, 40%]
+    - best_side="right" → building is RIGHT, sidewalk ≈ x ∈ [60%, 95%]
+
+    YOLO vehicle detections can refine this:
+    - If vehicles are on the OPPOSITE side from best_side → road is clearly
+      on the opposite side, we can use car edges for precise boundary.
+    - If vehicles are on the SAME side → car is parked in front of building;
+      sidewalk is behind the car at similar x. Use default best_side range.
+
+    Args:
+        yolo_obstacles: list of dicts from detect_obstacles()
+        best_side: "left" | "right" | "junction" | "none"
+        W, H: image dimensions in pixels
+
+    Returns:
+        dict with:
+            sidewalk_x_range: (x_min, x_max) in pixels, or None
+            road_x_range: (x_min, x_max) in pixels, or None
+            method: str — how the zone was determined
+    """
+    vehicle_classes = {"car", "truck", "bus", "motorcycle"}
+    vehicles = [o for o in yolo_obstacles if o["class_name"] in vehicle_classes]
+
+    # Default sidewalk ranges based on best_side (building side of the street)
+    # These are conservative: the sidewalk is typically between the building
+    # and the road, occupying roughly 15-40% of the image on one side.
+    if best_side == "left":
+        default_sw = (int(W * 0.05), int(W * 0.38))
+    elif best_side == "right":
+        default_sw = (int(W * 0.62), int(W * 0.95))
+    else:
+        return {
+            "sidewalk_x_range": None,
+            "road_x_range": None,
+            "method": "no_best_side",
+        }
+
+    if not vehicles:
+        return {
+            "sidewalk_x_range": default_sw,
+            "road_x_range": None,
+            "method": "best_side_default",
+        }
+
+    # Compute vehicle center of mass to determine which side road is on
+    vehicle_centers = [(o["bbox"][0] + o["bbox"][2]) / 2 for o in vehicles]
+    vehicle_com = sum(vehicle_centers) / len(vehicle_centers)
+    road_x_min = min(o["bbox"][0] for o in vehicles)
+    road_x_max = max(o["bbox"][2] for o in vehicles)
+
+    # Are vehicles on the OPPOSITE side from the building?
+    vehicles_opposite = (
+        (best_side == "left" and vehicle_com > W * 0.5) or
+        (best_side == "right" and vehicle_com < W * 0.5)
+    )
+
+    if vehicles_opposite:
+        # Vehicles on opposite side → road zone is clear. Use vehicle edge
+        # as the boundary between sidewalk and road for precise positioning.
+        pad = int(W * 0.03)
+        if best_side == "left":
+            # Sidewalk from left edge to where vehicles start
+            sw_max = max(int(W * 0.20), road_x_min - pad)
+            return {
+                "sidewalk_x_range": (int(W * 0.05), sw_max),
+                "road_x_range": (road_x_min, road_x_max),
+                "method": "vehicle_opposite_precise",
+            }
+        else:
+            # Sidewalk from where vehicles end to right edge
+            sw_min = min(int(W * 0.80), road_x_max + pad)
+            return {
+                "sidewalk_x_range": (sw_min, int(W * 0.95)),
+                "road_x_range": (road_x_min, road_x_max),
+                "method": "vehicle_opposite_precise",
+            }
+    else:
+        # Vehicles on SAME side as building → car is parked in front of
+        # building/sidewalk. We can't use gap between car and edge. Fall
+        # back to default best_side range — the 3D projection will place
+        # the box at the correct depth (behind the car).
+        return {
+            "sidewalk_x_range": default_sw,
+            "road_x_range": (road_x_min, road_x_max),
+            "method": "vehicle_same_side_default",
+        }
+
+
 def _project_3d_box(analysis, W, H, fov=90):
     """Project a 3D locker box onto the image plane using a pinhole camera model.
 
@@ -438,18 +534,54 @@ def markup_sv_image_3d(img_path, analysis, output_path, fov=90):
     if is_freestanding:
         r, g, b = (255, 165, 0)  # amber
 
-    # ── Obstacle detection (Exp C) ──
+    # ── YOLO obstacle + sidewalk detection (Exp C + G) ──
     obstacle_conflict = None
+    yolo_obstacles = []
+    sidewalk_shifted = False
     try:
         from obstacle_detection import detect_obstacles, check_overlap
-        # Compute bounding box of the front face for overlap check
-        all_x = [p[0] for p in front_pts]
-        all_y = [p[1] for p in front_pts]
-        locker_bbox = (min(all_x), min(all_y), max(all_x), max(all_y))
-        obstacles = detect_obstacles(img_path, conf_threshold=0.30)
-        obstacle_conflict = check_overlap(locker_bbox, obstacles)
+        yolo_obstacles = detect_obstacles(img_path, conf_threshold=0.30)
     except Exception:
-        pass  # YOLO not available — skip obstacle check
+        pass  # YOLO not available — skip obstacle + sidewalk check
+
+    # ── Sidewalk zone detection (Exp G) ──
+    # Check if the box is on the road and shift to sidewalk if needed
+    best_side = analysis.get("best_side", "")
+    sidewalk_info = _compute_sidewalk_zone(yolo_obstacles, best_side, W, H)
+
+    if sidewalk_info["sidewalk_x_range"]:
+        sw_min, sw_max = sidewalk_info["sidewalk_x_range"]
+        current_x_pct = analysis.get("placement_x_pct", 50)
+        current_x_px = current_x_pct / 100.0 * W
+
+        # Check if current placement is outside the sidewalk zone
+        if current_x_px < sw_min or current_x_px > sw_max:
+            # Shift to the center of the sidewalk strip
+            sw_center_px = (sw_min + sw_max) / 2
+            new_x_pct = sw_center_px / W * 100.0
+            # Clamp to keep within sidewalk
+            new_x_pct = max(sw_min / W * 100 + 5, min(sw_max / W * 100 - 5, new_x_pct))
+            analysis = dict(analysis)  # don't mutate original
+            analysis["placement_x_pct"] = new_x_pct
+            sidewalk_shifted = True
+            # Re-compute 3D projection with corrected x
+            proj = _project_3d_box(analysis, W, H, fov=fov)
+            if proj is None:
+                return markup_sv_image(img_path, analysis, output_path, fov=fov)
+            front_pts = proj["front"]
+            top_pts = proj["top"]
+            side_pts = proj["side"]
+
+    # ── Obstacle overlap check ──
+    if yolo_obstacles:
+        try:
+            from obstacle_detection import check_overlap
+            all_x = [p[0] for p in front_pts]
+            all_y = [p[1] for p in front_pts]
+            locker_bbox = (min(all_x), min(all_y), max(all_x), max(all_y))
+            obstacle_conflict = check_overlap(locker_bbox, yolo_obstacles)
+        except Exception:
+            pass
 
     # ── Draw faces on overlay ──
     overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
@@ -589,8 +721,12 @@ def markup_sv_image_3d(img_path, analysis, output_path, fov=90):
     badge_color = (255, 200, 100) if low_confidence else (255, 255, 100)
     draw.text((8, 7), badge, fill=badge_color, font=font)
 
-    # Placement type / confidence warning (line 2)
+    # Placement type / confidence / sidewalk warning (line 2)
     line2_y = 28
+    if sidewalk_shifted:
+        draw.text((8, line2_y), "\u2194 shifted to footpath",
+                  fill=(100, 220, 100), font=font)
+        line2_y += 14
     if is_freestanding:
         draw.text((8, line2_y), "FREESTANDING placement",
                   fill=(255, 165, 0), font=font)
@@ -601,9 +737,14 @@ def markup_sv_image_3d(img_path, analysis, output_path, fov=90):
 
     # Notes (bottom bar)
     notes = analysis.get("notes", "")
-    if notes:
+    extra_note = ""
+    if sidewalk_shifted:
+        method = sidewalk_info.get("method", "")
+        extra_note = f" [shifted from road to sidewalk via {method}]"
+    display_notes = (notes[:100] + extra_note) if notes else extra_note.strip()
+    if display_notes:
         draw.rectangle([0, H - 24, W, H], fill=(0, 0, 0, 160))
-        draw.text((6, H - 20), notes[:110], fill=(220, 220, 220), font=font)
+        draw.text((6, H - 20), display_notes[:120], fill=(220, 220, 220), font=font)
 
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
